@@ -1,0 +1,15 @@
+[Unit]
+Description=GPS Service
+
+[Service]
+ExecPreStart=timeout 60s bash -c 'until ip a s dev wlan0; do sleep 1; done'
+User=root
+ExecStart=sudo /usr/bin/python3 /home/orangepi/Documents/gps.py
+Restart=on-failure
+RestartSec=15
+StartLimitBurst=5
+StartLimitIntervalSec=60
+TimeoutSec=30
+
+[Install]
+WantedBy=multi-user.target
