@@ -13,5 +13,7 @@ sudo pip3 install pytz
 sudo pip3 install pynmea2
 sudo pip3 install geopy
 sudo python3 -m pip install zeep
+sudo apt install -y python3-evdev
+sudo pip3 install evdev
 sudo apt install sqlite3
 sudo apt-get install sqlitebrowser

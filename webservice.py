@@ -1,159 +1,254 @@
-import zeep
-import pytz
 import datetime
-import threading
-from time import sleep
-import uuid
 import os
 import subprocess
+import tempfile
+import time
+import uuid
 
-wsdl = 'http://45.32.7.136:8080/WebServiceSOLV3-3/SolSrv?wsdl'
-transport = zeep.Transport(timeout=5, operation_timeout=3)
-client = zeep.Client(wsdl=wsdl, transport=transport)
-timezone=pytz.timezone("America/Costa_Rica")
-def getFecha():
-		result=client.service.getFechaSrv()
-		file = open("/home/orangepi/Documents/fecha_srv.txt","w")
-		file.write(str(result))
-		file.close
-		command2="sudo timedatectl set-timezone America/Costa_Rica"	
-		command = f"sudo date -s \"{result}\""
+import pytz
+import zeep
+
+BASE_DIR = "/home/orangepi/Documents"
+DEVICE_ID_PATH = os.path.join(BASE_DIR, "device_id.txt")
+GPS_FILE = os.path.join(BASE_DIR, "gps.txt")
+KM_FILE = os.path.join(BASE_DIR, "km.txt")
+SERVER_STATUS = os.path.join(BASE_DIR, "serverstatus.txt")
+FECHA_FILE = os.path.join(BASE_DIR, "fecha_srv.txt")
+UNIDAD_FILE = os.path.join(BASE_DIR, "unidad_srv.txt")
+ENTRADAS_PE = os.path.join(BASE_DIR, "data_barras_entradas_pe.txt")
+ENTRADAS_PS = os.path.join(BASE_DIR, "data_barras_entradas_ps.txt")
+WSDL = "http://45.32.7.136:8080/WebServiceSOLV3-3/SolSrv?wsdl"
+timezone = pytz.timezone("America/Costa_Rica")
+
+client = None
+
+
+def atomic_write(path, data):
+	os.makedirs(os.path.dirname(path), exist_ok=True)
+	fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+	try:
+		with os.fdopen(fd, "w") as handle:
+			handle.write(data)
+			handle.flush()
+			os.fsync(handle.fileno())
+		os.replace(tmp, path)
+	except Exception:
 		try:
-			subprocess.run(command2, shell=True, check=True)
-			subprocess.run(command, shell=True, check=True)
-			print("Fecha Actualizada Exitosamente")
-			print(command)
-			return str(result)
-		except subprocess.CalledProcessError as e:
-			print(e)
+			os.unlink(tmp)
+		except OSError:
+			pass
+		raise
+
+
+def get_client():
+	global client
+	if client is None:
+		transport = zeep.Transport(timeout=5, operation_timeout=3)
+		client = zeep.Client(wsdl=WSDL, transport=transport)
+	return client
+
+
+def reset_client():
+	global client
+	client = None
+
+
+def device_id():
+	try:
+		if os.path.isfile(DEVICE_ID_PATH):
+			with open(DEVICE_ID_PATH, "r") as handle:
+				existing = handle.read().strip()
+			if existing:
+				return existing
+		os.makedirs(BASE_DIR, exist_ok=True)
+		new_id = str(uuid.uuid4())[-8:]
+		try:
+			fd = os.open(DEVICE_ID_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+		except FileExistsError:
+			with open(DEVICE_ID_PATH, "r") as handle:
+				existing = handle.read().strip()
+			if existing:
+				return existing
+			raise
+		with os.fdopen(fd, "w") as handle:
+			handle.write(new_id)
+		return new_id
+	except OSError as error:
+		print("No se pudo leer el id del dispositivo", error)
+		return "unknown"
+
+
+def getFecha():
+	result = get_client().service.getFechaSrv()
+	atomic_write(FECHA_FILE, str(result))
+	try:
+		subprocess.run(["timedatectl", "set-timezone", "America/Costa_Rica"], check=True)
+		subprocess.run(["date", "-s", str(result)], check=True)
+		print("Fecha Actualizada Exitosamente")
+		print(result)
+	except (subprocess.CalledProcessError, OSError) as error:
+		print(error)
+	return str(result)
+
 
 def server_alive():
+	now = datetime.datetime.now(timezone)
 	try:
-		
-		now=datetime.datetime.now(timezone)
-		result=client.service.checkConnection()
+		result = get_client().service.checkConnection()
 		print(result)
-		file = open("/home/orangepi/Documents/serverstatus.txt","w")
-		file.write(str(now) + " estado "+str(result)+"\n")
-		file.close
-		threading.Timer(10.0,server_alive).start()
-	except:
-		try:
-			if (now == None):
-				now=datetime.datetime.now()
-			file.write(str(now) + " estado SIN CONEXION")
-			file.close()
-			threading.Timer(10.0,server_alive).start()
-		except:
-			now=datetime.datetime.now()
-		file = open("/home/orangepi/Documents/serverstatus.txt","w")
+		atomic_write(SERVER_STATUS, str(now) + " estado " + str(result) + "\n")
+	except Exception:
 		print("SIN CONEXION")
-		file.write(str(now) + " estado SIN CONEXION")
-		file.close
-		threading.Timer(10.0,server_alive).start()
-def device_id():
-	if os.path.isfile("/home/orangepi/Documents/device_id.txt"):
-		with open("/home/orangepi/Documents/device_id.txt",'r') as file:
-			filedata=file.read()
-		file.close()	
-		return str(filedata)
-	else:
-		id=str(uuid.uuid4())	
-		filedata = id[-8:]
-		with open("/home/orangepi/Documents/device_id.txt",'w') as file:
-			file.write(filedata)
-		file.close()
-		return str(filedata)
+		reset_client()
+		try:
+			atomic_write(SERVER_STATUS, str(now) + " estado SIN CONEXION")
+		except OSError as error:
+			print(error)
+
+
 def getKM():
-	if os.path.isfile("/home/orangepi/Documents/km.txt"):
-		with open("/home/orangepi/Documents/km.txt",'r') as file:
-			filedata=file.read()
-		file.close()	
-		return str(filedata)
-	
-def getUnidad():
-	if os.path.isfile("/home/orangepi/Documents/device_id.txt"):
-		with open("/home/orangepi/Documents/device_id.txt",'r') as file:
-			filedata=file.read()
-		file.close()
-		result=client.service.getUnidad(str(filedata))
-		
-		file = open("/home/orangepi/Documents/unidad_srv.txt","w")
-		file.write(str(result))
-		file.close	
-		return str(result)
-	else:
-		device_id()
-		getUnidad()
-def send_data_srv():
 	try:
-		getUnidad()
-		deviceid=device_id()
-		entradas=get_entradas_pe()
-		salidas=get_salidas_pe()
-		entradas_ps=get_entradas_ps()
-		salidas_ps=get_salidas_ps()
-		latitud=get_latitud()
-		longitud=get_longitud()
-		velocidad=get_velocidad()
-		km=getKM()
-		now=datetime.datetime.now(timezone)
-		result=client.service.insertarTransmisionConKM(now,deviceid,latitud,longitud,velocidad,entradas,salidas,entradas_ps,salidas_ps,km)
-		#result=client.service.insertarTransmision('asdasd','adasd','adasd','adasd','adasd','adasd','adasd')
-		print(result)
-		threading.Timer(15.0,send_data_srv).start()
-	except Exception as e:
-		threading.Timer(15.0,send_data_srv).start()
-		print(e)
-	
+		with open(KM_FILE, "r") as handle:
+			filedata = handle.read().strip()
+		if filedata:
+			return filedata
+	except OSError:
+		pass
+	return "0"
+
+
+def getUnidad():
+	filedata = device_id()
+	result = get_client().service.getUnidad(str(filedata))
+	atomic_write(UNIDAD_FILE, str(result))
+	return str(result)
+
+
+def read_marked(path, label):
+	try:
+		with open(path, "r") as handle:
+			filedata = handle.read()
+		start = filedata.index(label) + len(label)
+		end = filedata.index("$$", start)
+		return int(filedata[start:end].strip())
+	except (OSError, ValueError):
+		return 0
+
+
 def get_salidas_pe():
-	if os.path.isfile("/home/orangepi/Documents/data_barras_entradas_pe.txt"):
-		with open("/home/orangepi/Documents/data_barras_entradas_pe.txt",'r') as file:
-			filedata=file.read()
-		total_marcas_sal=int(filedata[filedata.index("GeneralSalidasPe: ")+18:filedata.index("$$",filedata.index("GeneralSalidasPe: "))])
-		return total_marcas_sal
+	return read_marked(ENTRADAS_PE, "GeneralSalidasPe: ")
+
+
 def get_salidas_ps():
-	if os.path.isfile("/home/orangepi/Documents/data_barras_entradas_ps.txt"):
-		with open("/home/orangepi/Documents/data_barras_entradas_ps.txt",'r') as file:
-			filedata=file.read()
-		total_marcas_sal_ps=int(filedata[filedata.index("GeneralSalidasPs: ")+18:filedata.index("$$",filedata.index("GeneralSalidasPs: "))])
-		return total_marcas_sal_ps
+	return read_marked(ENTRADAS_PS, "GeneralSalidasPs: ")
+
+
 def get_entradas_pe():
-	if os.path.isfile("/home/orangepi/Documents/data_barras_entradas_pe.txt"):
-		with open("/home/orangepi/Documents/data_barras_entradas_pe.txt",'r') as file:
-			filedata=file.read()
-		total_marcas_ent=int(filedata[filedata.index("GeneralEntradasPe: ")+19:filedata.index("$$",filedata.index("GeneralEntradasPe: "))])
-		return total_marcas_ent
+	return read_marked(ENTRADAS_PE, "GeneralEntradasPe: ")
+
+
 def get_entradas_ps():
-	if os.path.isfile("/home/orangepi/Documents/data_barras_entradas_ps.txt"):
-		with open("/home/orangepi/Documents/data_barras_entradas_ps.txt",'r') as file:
-			filedata=file.read()
-		total_marcas_ent_ps=int(filedata[filedata.index("GeneralEntradasPs: ")+19:filedata.index("$$",filedata.index("GeneralEntradasPs: "))])
-		return total_marcas_ent_ps
+	return read_marked(ENTRADAS_PS, "GeneralEntradasPs: ")
+
+
 def get_latitud():
-	if os.path.isfile("/home/orangepi/Documents/gps.txt"):
-		with open("/home/orangepi/Documents/gps.txt",'r') as file:
-			filedata=file.read()
-		latitud=(filedata[filedata.index("Latitud:")+8:filedata.index(",",filedata.index("Latitud:"))])
-		return latitud
+	try:
+		with open(GPS_FILE, "r") as handle:
+			filedata = handle.read()
+		if "Latitud:" not in filedata:
+			return "0"
+		start = filedata.index("Latitud:") + 8
+		end = filedata.index(",", start)
+		return filedata[start:end].strip() or "0"
+	except (OSError, ValueError):
+		return "0"
+
+
 def get_longitud():
-	if os.path.isfile("/home/orangepi/Documents/gps.txt"):
-		with open("/home/orangepi/Documents/gps.txt",'r') as file:
-			filedata=file.read()
-		longitud=(filedata[filedata.index("Longitud: ")+10:filedata.index(",",filedata.index("Longitud: "))])
-		return longitud
+	try:
+		with open(GPS_FILE, "r") as handle:
+			filedata = handle.read()
+		if "Longitud: " not in filedata:
+			return "0"
+		start = filedata.index("Longitud: ") + 10
+		end = filedata.index(",", start)
+		return filedata[start:end].strip() or "0"
+	except (OSError, ValueError):
+		return "0"
+
 
 def get_velocidad():
-	if os.path.isfile("/home/orangepi/Documents/gps.txt"):
-		with open("/home/orangepi/Documents/gps.txt",'r') as file:
-			filedata=file.read()
-		velocidad=float(filedata[filedata.index("Velocidad: ")+11:])
+	try:
+		with open(GPS_FILE, "r") as handle:
+			filedata = handle.read()
+		if "Velocidad: " not in filedata:
+			return 0.0
+		start = filedata.index("Velocidad: ") + 11
+		velocidad = float(filedata[start:].strip())
 		print(velocidad)
 		return velocidad
+	except (OSError, ValueError):
+		return 0.0
 
 
-print("Device Id:" + device_id())
-print("Unidad Sol:" + getUnidad())
-print("Unidad Sol:" + getFecha())
-threading.Timer(5.0,server_alive).start()
-threading.Timer(2.0,send_data_srv).start()
+def send_data_srv():
+	try:
+		print("Unidad Sol:" + getUnidad())
+	except Exception as error:
+		print(error)
+		reset_client()
+	try:
+		deviceid = device_id()
+		entradas = get_entradas_pe()
+		salidas = get_salidas_pe()
+		entradas_ps = get_entradas_ps()
+		salidas_ps = get_salidas_ps()
+		latitud = get_latitud()
+		longitud = get_longitud()
+		velocidad = get_velocidad()
+		km = getKM()
+		now = datetime.datetime.now(timezone)
+		result = get_client().service.insertarTransmisionConKM(
+			now, deviceid, latitud, longitud, velocidad, entradas, salidas, entradas_ps, salidas_ps, km
+		)
+		print(result)
+	except Exception as error:
+		print(error)
+		reset_client()
+
+
+def main():
+	print("Device Id:" + device_id())
+	last_check = None
+	last_send = None
+	last_fecha_ok = None
+	last_fecha_try = None
+	while True:
+		now = time.monotonic()
+		fecha_pendiente = last_fecha_ok is None or now - last_fecha_ok >= 3600
+		fecha_puede_reintentar = last_fecha_try is None or now - last_fecha_try >= 60
+		if fecha_pendiente and fecha_puede_reintentar:
+			last_fecha_try = now
+			try:
+				print("Fecha srv:" + getFecha())
+				last_fecha_ok = time.monotonic()
+			except Exception as error:
+				print(error)
+				reset_client()
+		now = time.monotonic()
+		if last_check is None or now - last_check >= 10:
+			try:
+				server_alive()
+			except Exception as error:
+				print(error)
+				reset_client()
+			last_check = time.monotonic()
+		now = time.monotonic()
+		if last_send is None or now - last_send >= 15:
+			send_data_srv()
+			last_send = time.monotonic()
+		time.sleep(1)
+
+
+if __name__ == "__main__":
+	main()

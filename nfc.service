@@ -1,0 +1,13 @@
+[Unit]
+Description=NFC Reader Service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /home/orangepi/Documents/nfc.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

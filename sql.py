@@ -1,132 +1,197 @@
-import pytz
 import datetime
-import threading
-from time import sleep
-import uuid
 import os
 import sqlite3
+import time
+import uuid
 
-con = sqlite3.connect("/home/orangepi/Documents/backup.db")
-cur = con.cursor()
-cur.execute("CREATE TABLE if not exists monitoreo(Fecha DATETIME not null,DeviceId VARCHAR(50) not null, latitud FLOAT not null, longitud FLOAT not null, Velocidad FLOAT not null, GeneralEntradasPe INTEGER not null, GeneralSalidasPe INTEGER not null, GeneralEntradasPs INTEGER not null, GeneralSalidasPs INTEGER not null, SrvOnline VARCHAR(50) not null)")
-timezone=pytz.timezone("America/Costa_Rica")
+import pytz
+
+BASE_DIR = "/home/orangepi/Documents"
+DB_PATH = os.path.join(BASE_DIR, "backup.db")
+DEVICE_ID_PATH = os.path.join(BASE_DIR, "device_id.txt")
+GPS_FILE = os.path.join(BASE_DIR, "gps.txt")
+SERVER_STATUS = os.path.join(BASE_DIR, "serverstatus.txt")
+ENTRADAS_PE = os.path.join(BASE_DIR, "data_barras_entradas_pe.txt")
+ENTRADAS_PS = os.path.join(BASE_DIR, "data_barras_entradas_ps.txt")
+timezone = pytz.timezone("America/Costa_Rica")
+PURGE_SECONDS = 24 * 60 * 60
+
+CREATE_TABLE = """
+CREATE TABLE if not exists monitoreo(
+	Fecha DATETIME not null,
+	DeviceId VARCHAR(50) not null,
+	latitud FLOAT not null,
+	longitud FLOAT not null,
+	Velocidad FLOAT not null,
+	GeneralEntradasPe INTEGER not null,
+	GeneralSalidasPe INTEGER not null,
+	GeneralEntradasPs INTEGER not null,
+	GeneralSalidasPs INTEGER not null,
+	SrvOnline VARCHAR(50) not null
+)
+"""
+
+
+def device_id():
+	try:
+		if os.path.isfile(DEVICE_ID_PATH):
+			with open(DEVICE_ID_PATH, "r") as handle:
+				existing = handle.read().strip()
+			if existing:
+				return existing
+		os.makedirs(BASE_DIR, exist_ok=True)
+		new_id = str(uuid.uuid4())[-8:]
+		try:
+			fd = os.open(DEVICE_ID_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+		except FileExistsError:
+			with open(DEVICE_ID_PATH, "r") as handle:
+				existing = handle.read().strip()
+			if existing:
+				return existing
+			raise
+		with os.fdopen(fd, "w") as handle:
+			handle.write(new_id)
+		return new_id
+	except OSError as error:
+		print("No se pudo leer el id del dispositivo", error)
+		return "unknown"
+
+
+def connect():
+	os.makedirs(BASE_DIR, exist_ok=True)
+	con = sqlite3.connect(DB_PATH, timeout=10)
+	con.execute("PRAGMA journal_mode=WAL")
+	return con
+
+
+def init_db():
+	con = connect()
+	try:
+		con.execute(CREATE_TABLE)
+		con.commit()
+	finally:
+		con.close()
+
+
+def read_marked(path, label):
+	try:
+		with open(path, "r") as handle:
+			filedata = handle.read()
+		start = filedata.index(label) + len(label)
+		end = filedata.index("$$", start)
+		return int(filedata[start:end].strip())
+	except (OSError, ValueError):
+		return 0
+
+
+def get_salidas_pe():
+	return read_marked(ENTRADAS_PE, "GeneralSalidasPe: ")
+
+
+def get_salidas_ps():
+	return read_marked(ENTRADAS_PS, "GeneralSalidasPs: ")
+
+
+def get_entradas_pe():
+	return read_marked(ENTRADAS_PE, "GeneralEntradasPe: ")
+
+
+def get_entradas_ps():
+	return read_marked(ENTRADAS_PS, "GeneralEntradasPs: ")
+
+
+def read_gps_field(prefix, end_at_comma):
+	try:
+		with open(GPS_FILE, "r") as handle:
+			filedata = handle.read()
+		if prefix not in filedata:
+			return 0.0
+		start = filedata.index(prefix) + len(prefix)
+		if end_at_comma:
+			end = filedata.index(",", start)
+			return float(filedata[start:end].strip())
+		return float(filedata[start:].strip())
+	except (OSError, ValueError):
+		return 0.0
+
+
+def get_latitud():
+	return read_gps_field("Latitud:", True)
+
+
+def get_longitud():
+	return read_gps_field("Longitud: ", True)
+
+
+def get_velocidad():
+	velocidad = read_gps_field("Velocidad: ", False)
+	print(velocidad)
+	return velocidad
+
 
 def server_alive():
 	try:
-		if os.path.isfile("/home/orangepi/Documents/serverstatus.txt"):
-			with open("/home/orangepi/Documents/serverstatus.txt",'r') as file:
-				filedata=file.read()
-			file.close()	
-			return str(filedata)
-			threading.Timer(10.0,server_alive).start()
-	except:
-		
-		threading.Timer(10.0,server_alive).start()
-def device_id():
-	if os.path.isfile("/home/orangepi/Documents/device_id.txt"):
-		with open("/home/orangepi/Documents/device_id.txt",'r') as file:
-			filedata=file.read()
-		file.close()	
-		return str(filedata)
-	else:
-		id=str(uuid.uuid4())	
-		filedata = id[-8:]
-		with open("/home/orangepi/Documents/device_id.txt",'w') as file:
-			file.write(filedata)
-		file.close()
-		return str(filedata)
+		with open(SERVER_STATUS, "r") as handle:
+			filedata = handle.read()
+		if "True" in filedata:
+			return "True"
+	except OSError:
+		pass
+	return "False"
+
+
 def save_data_sql():
+	deviceid = device_id()
+	entradas = get_entradas_pe()
+	salidas = get_salidas_pe()
+	entradas_ps = get_entradas_ps()
+	salidas_ps = get_salidas_ps()
+	latitud = get_latitud()
+	longitud = get_longitud()
+	velocidad = get_velocidad()
+	is_online = server_alive()
+	now = datetime.datetime.now(timezone)
+	fecha = now.strftime("%Y-%m-%d %H:%M:%S")
+	con = connect()
 	try:
-		deviceid=device_id()
-		entradas=get_entradas_pe()
-		salidas=get_salidas_pe()
-		entradas_ps=get_entradas_ps()
-		salidas_ps=get_salidas_ps()
-		#latitud=get_latitud()
-		#longitud=get_longitud()
-		#velocidad=get_velocidad()
-		latitud='0'
-		longitud='0'
-		velocidad='0'
-		isOnline=server_alive()
-		if(len(isOnline) and isOnline.find("True")>0):
-			isOnline="True"
-		else:
-			isOnline="False"
-		now=datetime.datetime.now(timezone)
-		fecha=now.strftime("%Y-%m-%d %H:%M:%S")
-		con = sqlite3.connect("/home/orangepi/Documents/backup.db")
 		cur = con.cursor()
-		sentencia ="insert into monitoreo (Fecha, DeviceId, latitud, longitud, velocidad, GeneralEntradasPe, GeneralSalidasPe, GeneralEntradasPs, GeneralSalidasPs, SrvOnline) values ('"+fecha+"','"+str(deviceid)+"','"+str(latitud)+"','"+str(longitud)+"','"+str(velocidad)+"','"+str(entradas)+"','"+str(salidas)+"','"+str(entradas_ps)+"','"+str(salidas_ps)+"','"+str(isOnline)+"')"
-		print(sentencia)
-		cur.execute(sentencia)
+		cur.execute(
+			"insert into monitoreo (Fecha, DeviceId, latitud, longitud, Velocidad, GeneralEntradasPe, GeneralSalidasPe, GeneralEntradasPs, GeneralSalidasPs, SrvOnline) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			(fecha, str(deviceid), latitud, longitud, velocidad, entradas, salidas, entradas_ps, salidas_ps, is_online),
+		)
 		con.commit()
-		
-		threading.Timer(30.0,save_data_sql).start()
-	except Exception as e:
-		threading.Timer(30.0,save_data_sql).start()
-		print("Error al insertar dato ")
-		print(e)
+		print("Respaldo guardado", fecha, deviceid, latitud, longitud, velocidad, is_online)
+	finally:
+		con.close()
+
+
 def delete_data_sql():
+	con = connect()
 	try:
-		con = sqlite3.connect("/home/orangepi/Documents/backup.db")
 		cur = con.cursor()
-		sentencia ="delete from monitoreo where Fecha < DATETIME('now','-180 day')"
-		print(sentencia)
-		cur.execute(sentencia)
+		cur.execute("delete from monitoreo where Fecha < DATETIME('now','-180 day')")
 		con.commit()
-		
-	except Exception as e:
-		
-		print("Error al borrar dato ")
-		print(e)
-def get_salidas_pe():
-	if os.path.isfile("/home/orangepi/Documents/data_barras_entradas_pe.txt"):
-		with open("/home/orangepi/Documents/data_barras_entradas_pe.txt",'r') as file:
-			filedata=file.read()
-		total_marcas_sal=int(filedata[filedata.index("GeneralSalidasPe: ")+18:filedata.index("$$",filedata.index("GeneralSalidasPe: "))])
-		return total_marcas_sal
-def get_salidas_ps():
-	if os.path.isfile("/home/orangepi/Documents/data_barras_entradas_ps.txt"):
-		with open("/home/orangepi/Documents/data_barras_entradas_ps.txt",'r') as file:
-			filedata=file.read()
-		total_marcas_sal_ps=int(filedata[filedata.index("GeneralSalidasPs: ")+18:filedata.index("$$",filedata.index("GeneralSalidasPs: "))])
-		return total_marcas_sal_ps
-def get_entradas_pe():
-	if os.path.isfile("/home/orangepi/Documents/data_barras_entradas_pe.txt"):
-		with open("/home/orangepi/Documents/data_barras_entradas_pe.txt",'r') as file:
-			filedata=file.read()
-		total_marcas_ent=int(filedata[filedata.index("GeneralEntradasPe: ")+19:filedata.index("$$",filedata.index("GeneralEntradasPe: "))])
-		return total_marcas_ent
-def get_entradas_ps():
-	if os.path.isfile("/home/orangepi/Documents/data_barras_entradas_ps.txt"):
-		with open("/home/orangepi/Documents/data_barras_entradas_ps.txt",'r') as file:
-			filedata=file.read()
-		total_marcas_ent_ps=int(filedata[filedata.index("GeneralEntradasPs: ")+19:filedata.index("$$",filedata.index("GeneralEntradasPs: "))])
-		return total_marcas_ent_ps
-def get_latitud():
-	if os.path.isfile("/home/orangepi/Documents/gps.txt"):
-		with open("/home/orangepi/Documents/gps.txt",'r') as file:
-			filedata=file.read()
-		latitud=(filedata[filedata.index("Latitud:")+8:filedata.index(",",filedata.index("Latitud:"))])
-		return latitud
-def get_longitud():
-	if os.path.isfile("/home/orangepi/Documents/gps.txt"):
-		with open("/home/orangepi/Documents/gps.txt",'r') as file:
-			filedata=file.read()
-		longitud=(filedata[filedata.index("Longitud: ")+10:filedata.index(",",filedata.index("Longitud: "))])
-		return longitud
-
-def get_velocidad():
-	if os.path.isfile("/home/orangepi/Documents/gps.txt"):
-		with open("/home/orangepi/Documents/gps.txt",'r') as file:
-			filedata=file.read()
-		velocidad=float(filedata[filedata.index("Velocidad: ")+11:])
-		print(velocidad)
-		return velocidad
+		print("Limpieza de respaldos mayores a 180 dias")
+	finally:
+		con.close()
 
 
-print("Device Id:" + device_id())
-delete_data_sql()
-threading.Timer(5.0,server_alive).start()
-threading.Timer(2.0,save_data_sql).start()
+def main():
+	print("Device Id:" + device_id())
+	last_purge = 0
+	while True:
+		try:
+			init_db()
+			now = time.monotonic()
+			if last_purge == 0 or now - last_purge >= PURGE_SECONDS:
+				delete_data_sql()
+				last_purge = now
+			save_data_sql()
+		except Exception as error:
+			print("Error al insertar dato ")
+			print(error)
+		time.sleep(30)
+
+
+if __name__ == "__main__":
+	main()

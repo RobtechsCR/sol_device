@@ -1,18 +1,13 @@
 [Unit]
 Description=Updater Service
-Requires=network-online.target
-After=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
-ExecPreStart=timeout 60s bash -c 'until ip a s dev wlan0; do sleep 1; done'
 Type=simple
-WorkingDirectory=/home/orangepi/Documents/
-ExecStart=sudo /usr/bin/python3 updater.py
-Restart=on-failure
-RestartSec=15
-StartLimitBurst=5
-StartLimitIntervalSec=60
-TimeoutSec=30
+User=root
+ExecStart=/usr/bin/python3 /home/orangepi/Documents/updater.py
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
