@@ -13,6 +13,8 @@ LOG_FILE = os.path.join(BASE_DIR, "nfc_lecturas.txt")
 GPS_FILE = os.path.join(BASE_DIR, "gps.txt")
 UNIDAD_FILE = os.path.join(BASE_DIR, "unidad_srv.txt")
 BUS_FILE = os.path.join(BASE_DIR, "bus_numero.txt")
+DEVICE_ID_PATH = os.path.join(BASE_DIR, "device_id.txt")
+WSDL = "http://45.32.7.136:8080/WebServiceSOLV3-3/SolSrv?wsdl"
 DB_CONFIG_FILE = os.path.join(BASE_DIR, "sos_db.txt")
 QUEUE_FILE = os.path.join(BASE_DIR, "asistencia_pendiente.txt")
 RESULT_FILE = os.path.join(BASE_DIR, "asistencia.txt")
@@ -33,6 +35,7 @@ SECUENCIA_INVALIDA = (
 )
 gpio_listo = False
 gpio_lock = threading.Lock()
+soap_client = None
 SOS_DB_HOST = "45.32.7.136"
 SOS_DB_PORT = 3306
 SOS_DB_NAME = "sos"
@@ -144,16 +147,70 @@ def db_config():
 	return config
 
 
+def normalizar_bus(value):
+	if value is None:
+		return ""
+	text = str(value).strip()
+	if text.lower() in ("", "none", "null", "unknown"):
+		return ""
+	return text
+
+
 def read_bus_numero():
 	for path in (BUS_FILE, UNIDAD_FILE):
 		try:
 			with open(path, "r") as handle:
-				value = handle.read().strip()
+				value = normalizar_bus(handle.read())
 		except OSError:
 			continue
-		if value and value.lower() not in ("none", "null"):
+		if value:
 			return value
 	return ""
+
+
+def read_device_id():
+	try:
+		with open(DEVICE_ID_PATH, "r") as handle:
+			return normalizar_bus(handle.read())
+	except OSError:
+		return ""
+
+
+def get_soap_client():
+	global soap_client
+	if soap_client is None:
+		import zeep
+		transport = zeep.Transport(timeout=5, operation_timeout=5)
+		soap_client = zeep.Client(wsdl=WSDL, transport=transport)
+	return soap_client
+
+
+def reset_soap_client():
+	global soap_client
+	soap_client = None
+
+
+def consultar_unidad():
+	serial = read_device_id()
+	if not serial:
+		print("No hay device_id.txt para consultar el numero de bus")
+		return ""
+	try:
+		result = get_soap_client().service.getUnidad(serial)
+	except Exception as error:
+		reset_soap_client()
+		print("No se pudo consultar la unidad", error)
+		return ""
+	bus = normalizar_bus(result)
+	if not bus:
+		print("El servidor no tiene numero de bus para " + serial)
+		return ""
+	try:
+		atomic_write(UNIDAD_FILE, bus)
+	except OSError as error:
+		print(error)
+	print("Numero de bus " + bus)
+	return bus
 
 
 def read_position():
@@ -392,6 +449,8 @@ def process_queue_once():
 	item = dict(items[0])
 	if not item.get("bus"):
 		item["bus"] = read_bus_numero()
+	if not item.get("bus"):
+		item["bus"] = consultar_unidad()
 	if not item.get("bus"):
 		print("Asistencia en espera, falta el numero de bus")
 		return False
