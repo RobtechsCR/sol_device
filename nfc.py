@@ -1,14 +1,39 @@
+import csv
 import datetime
+import json
 import os
 import tempfile
+import threading
 import time
 
 BASE_DIR = "/home/orangepi/Documents"
 DEVICE_FILE = os.path.join(BASE_DIR, "nfc_device.txt")
 LAST_FILE = os.path.join(BASE_DIR, "nfc.txt")
 LOG_FILE = os.path.join(BASE_DIR, "nfc_lecturas.txt")
+GPS_FILE = os.path.join(BASE_DIR, "gps.txt")
+UNIDAD_FILE = os.path.join(BASE_DIR, "unidad_srv.txt")
+BUS_FILE = os.path.join(BASE_DIR, "bus_numero.txt")
+DB_CONFIG_FILE = os.path.join(BASE_DIR, "sos_db.txt")
+QUEUE_FILE = os.path.join(BASE_DIR, "asistencia_pendiente.txt")
+RESULT_FILE = os.path.join(BASE_DIR, "asistencia.txt")
+RESULT_LOG = os.path.join(BASE_DIR, "asistencia_log.txt")
 BURST_SECONDS = 1.0
 DUPLICATE_SECONDS = 2.0
+DEFAULT_ACCURACY_METERS = 10
+SOS_DB_HOST = "45.32.7.136"
+SOS_DB_PORT = 3306
+SOS_DB_NAME = "sos"
+ASISTENCIA_FIELDS = (
+	"attendance_id",
+	"horario_id",
+	"duplicate",
+	"mensaje",
+	"empresa_id",
+	"fecha_servicio",
+)
+CALL_SQL = "CALL proc_registrar_asistencia_entrada(%s, %s, %s, %s, %s)"
+queue_lock = threading.Lock()
+worker_started = False
 SPECIFIC_HINTS = ("rfid", "nfc", "mifare", "barcode", "reader", "card", "sycreader", "proximity")
 GENERIC_HINTS = ("hid",)
 
@@ -75,6 +100,304 @@ def timestamp():
 		return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def parse_db_config(text):
+	found = {}
+	for line in str(text).splitlines():
+		line = line.strip()
+		if not line or line.startswith("#") or "=" not in line:
+			continue
+		key, value = line.split("=", 1)
+		key = key.strip().lower()
+		if key in ("host", "port", "user", "password", "database"):
+			found[key] = value.strip()
+	if "port" in found and found["port"]:
+		found["port"] = int(found["port"])
+	return found
+
+
+def db_config():
+	config = {
+		"host": SOS_DB_HOST,
+		"port": SOS_DB_PORT,
+		"user": "",
+		"password": "",
+		"database": SOS_DB_NAME,
+	}
+	try:
+		with open(DB_CONFIG_FILE, "r") as handle:
+			config.update(parse_db_config(handle.read()))
+	except OSError:
+		pass
+	return config
+
+
+def read_bus_numero():
+	for path in (BUS_FILE, UNIDAD_FILE):
+		try:
+			with open(path, "r") as handle:
+				value = handle.read().strip()
+		except OSError:
+			continue
+		if value and value.lower() not in ("none", "null"):
+			return value
+	return ""
+
+
+def read_position():
+	try:
+		with open(GPS_FILE, "r") as handle:
+			data = handle.read()
+		if "Latitud:" not in data or "Longitud: " not in data:
+			return 0.0, 0.0
+		lat_start = data.index("Latitud:") + 8
+		lat_end = data.index(",", lat_start)
+		lng_start = data.index("Longitud: ") + 10
+		lng_end = data.index(",", lng_start)
+		return float(data[lat_start:lat_end].strip()), float(data[lng_start:lng_end].strip())
+	except (OSError, ValueError):
+		return 0.0, 0.0
+
+
+def nueva_lectura(codigo, bus, lat, lng, fecha, accuracy=DEFAULT_ACCURACY_METERS):
+	return {
+		"codigo": "" if codigo is None else str(codigo).strip(),
+		"bus": "" if bus is None else str(bus).strip(),
+		"lat": float(lat or 0),
+		"lng": float(lng or 0),
+		"accuracy": int(accuracy),
+		"fecha": fecha,
+	}
+
+
+def asistencia_params(item):
+	return (
+		item["bus"],
+		item["codigo"],
+		float(item["lat"]),
+		float(item["lng"]),
+		int(item.get("accuracy", DEFAULT_ACCURACY_METERS)),
+	)
+
+
+def split_csv_row(text):
+	return next(csv.reader([str(text)]))
+
+
+def parse_asistencia_row(row):
+	if row is None:
+		return None
+	if isinstance(row, dict):
+		if all(key in row for key in ASISTENCIA_FIELDS):
+			return {key: "" if row[key] is None else str(row[key]) for key in ASISTENCIA_FIELDS}
+		row = tuple(row.values())
+	if isinstance(row, (list, tuple)) and len(row) == 1 and isinstance(row[0], str) and "," in row[0]:
+		row = split_csv_row(row[0])
+	if not isinstance(row, (list, tuple)) or len(row) < len(ASISTENCIA_FIELDS):
+		return None
+	return {
+		key: "" if value is None else str(value)
+		for key, value in zip(ASISTENCIA_FIELDS, row)
+	}
+
+
+def is_tarjeta_rechazada(error):
+	if getattr(error, "sqlstate", None) == "45000":
+		return True
+	args = getattr(error, "args", ())
+	if args and args[0] == 1644:
+		return True
+	return "45000" in str(error)
+
+
+def error_mensaje(error):
+	args = getattr(error, "args", ())
+	if len(args) > 1 and args[1]:
+		return str(args[1])
+	return str(error)
+
+
+def load_queue():
+	try:
+		with open(QUEUE_FILE, "r") as handle:
+			lines = handle.read().splitlines()
+	except OSError:
+		return []
+	items = []
+	for line in lines:
+		line = line.strip()
+		if not line:
+			continue
+		try:
+			item = json.loads(line)
+		except ValueError:
+			print("Lectura pendiente ilegible")
+			continue
+		if isinstance(item, dict) and item.get("codigo"):
+			items.append(item)
+	return items
+
+
+def save_queue(items):
+	body = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in items)
+	atomic_write(QUEUE_FILE, body)
+
+
+def enqueue_asistencia(codigo):
+	lat, lng = read_position()
+	item = nueva_lectura(codigo, read_bus_numero(), lat, lng, timestamp())
+	with queue_lock:
+		items = load_queue()
+		items.append(item)
+		save_queue(items)
+	print("Asistencia en cola " + item["codigo"])
+	return item
+
+
+def record_result(result):
+	body = json.dumps(result, ensure_ascii=False)
+	atomic_write(RESULT_FILE, body + "\n")
+	with open(RESULT_LOG, "a") as handle:
+		handle.write(body + "\n")
+		handle.flush()
+	print(result.get("estado", ""), result.get("mensaje", ""), result.get("tarjeta", ""))
+
+
+def connect_sos():
+	import pymysql
+	config = db_config()
+	if not config.get("user"):
+		raise RuntimeError("Falta el usuario de la base sos en " + DB_CONFIG_FILE)
+	return pymysql.connect(
+		host=config["host"],
+		port=int(config["port"]),
+		user=config["user"],
+		password=config["password"],
+		database=config["database"],
+		connect_timeout=5,
+		read_timeout=8,
+		write_timeout=8,
+		autocommit=True,
+		charset="utf8mb4",
+	)
+
+
+def fetch_asistencia(cursor, item):
+	cursor.execute(CALL_SQL, asistencia_params(item))
+	row = cursor.fetchone()
+	while row is None and cursor.nextset():
+		row = cursor.fetchone()
+	return row
+
+
+def call_registrar(item):
+	connection = connect_sos()
+	try:
+		with connection.cursor() as cursor:
+			return fetch_asistencia(cursor, item)
+	finally:
+		connection.close()
+
+
+def drop_item(item):
+	with queue_lock:
+		items = load_queue()
+		remaining = []
+		removed = False
+		for current in items:
+			if not removed and current.get("codigo") == item.get("codigo") and current.get("fecha") == item.get("fecha"):
+				removed = True
+				continue
+			remaining.append(current)
+		save_queue(remaining)
+
+
+def resultado_base(item):
+	return {
+		"tarjeta": item.get("codigo", ""),
+		"bus": item.get("bus", ""),
+		"lat": item.get("lat", 0),
+		"lng": item.get("lng", 0),
+		"accuracy_meters": int(item.get("accuracy", DEFAULT_ACCURACY_METERS)),
+		"fecha": item.get("fecha", ""),
+	}
+
+
+def process_queue_once():
+	with queue_lock:
+		items = load_queue()
+	if not items:
+		return False
+	item = dict(items[0])
+	if not item.get("bus"):
+		item["bus"] = read_bus_numero()
+	if not item.get("bus"):
+		print("Asistencia en espera, falta el numero de bus")
+		return False
+	try:
+		row = call_registrar(item)
+	except Exception as error:
+		if not is_tarjeta_rechazada(error):
+			print("No se pudo registrar asistencia", error)
+			return False
+		result = resultado_base(item)
+		result.update({
+			"estado": "rechazada",
+			"mensaje": error_mensaje(error),
+			"attendance_id": "",
+			"horario_id": "",
+			"duplicate": "",
+			"empresa_id": "",
+			"fecha_servicio": "",
+		})
+		record_result(result)
+		drop_item(item)
+		return True
+	parsed = parse_asistencia_row(row)
+	if not parsed:
+		result = resultado_base(item)
+		result.update({
+			"estado": "sin_datos",
+			"mensaje": "La base sos no devolvio la asistencia",
+			"attendance_id": "",
+			"horario_id": "",
+			"duplicate": "",
+			"empresa_id": "",
+			"fecha_servicio": "",
+		})
+		record_result(result)
+		drop_item(item)
+		return True
+	result = resultado_base(item)
+	result.update(parsed)
+	result["estado"] = "registrada"
+	record_result(result)
+	drop_item(item)
+	return True
+
+
+def process_pending():
+	while process_queue_once():
+		pass
+
+
+def worker():
+	while True:
+		try:
+			process_pending()
+		except Exception as error:
+			print("Error asistencia", error)
+		time.sleep(2)
+
+
+def start_worker():
+	global worker_started
+	if worker_started:
+		return
+	thread = threading.Thread(target=worker, name="asistencia-sos", daemon=True)
+	thread.start()
+	worker_started = True
+
+
 def save_read(code):
 	stamp = timestamp()
 	atomic_write(LAST_FILE, "Tarjeta:" + code + ",Fecha: " + stamp + "\n")
@@ -82,6 +405,10 @@ def save_read(code):
 		handle.write(stamp + " " + code + "\n")
 		handle.flush()
 	print("Tarjeta leida " + code)
+	try:
+		enqueue_asistencia(code)
+	except Exception as error:
+		print("No se pudo encolar la asistencia", error)
 
 
 def configured_device():
@@ -278,6 +605,7 @@ def read_loop(device, evdev_module):
 
 
 def main():
+	start_worker()
 	while True:
 		device = None
 		try:
