@@ -20,6 +20,19 @@ RESULT_LOG = os.path.join(BASE_DIR, "asistencia_log.txt")
 BURST_SECONDS = 1.0
 DUPLICATE_SECONDS = 2.0
 DEFAULT_ACCURACY_METERS = 10
+# Pin fisico 7 del conector. wiringPiSetup(), igual que gpio.py, usa el numero wPi.
+# En Orange Pi 5 ese pin es wPi 2 (GPIO 54, PWM15). En el conector H5 tambien es wPi 2 (PWM.1).
+PIN_AVISO = 2
+SECUENCIA_VALIDA = ((0.5, 1), (0.5, 0), (0.5, 1))
+SECUENCIA_INVALIDA = (
+	(0.2, 1), (0.5, 0),
+	(0.2, 1), (0.5, 0),
+	(0.2, 1), (0.5, 0),
+	(0.2, 1), (0.5, 0),
+	(0.2, 1),
+)
+gpio_listo = False
+gpio_lock = threading.Lock()
 SOS_DB_HOST = "45.32.7.136"
 SOS_DB_PORT = 3306
 SOS_DB_NAME = "sos"
@@ -253,6 +266,55 @@ def enqueue_asistencia(codigo):
 	return item
 
 
+def secuencia_para_estado(estado):
+	if estado == "registrada":
+		return SECUENCIA_VALIDA
+	if estado == "rechazada":
+		return SECUENCIA_INVALIDA
+	return ()
+
+
+def reproducir_secuencia(secuencia, escribir, esperar):
+	for duracion, nivel in secuencia:
+		escribir(nivel)
+		esperar(duracion)
+	escribir(0)
+
+
+def preparar_gpio():
+	global gpio_listo
+	if gpio_listo:
+		return
+	import wiringpi
+	from wiringpi import GPIO
+	if wiringpi.wiringPiSetup() == -1:
+		raise RuntimeError("wiringPiSetup no pudo iniciar")
+	wiringpi.pinMode(PIN_AVISO, GPIO.OUTPUT)
+	wiringpi.digitalWrite(PIN_AVISO, GPIO.LOW)
+	gpio_listo = True
+
+
+def escribir_gpio(nivel):
+	import wiringpi
+	from wiringpi import GPIO
+	wiringpi.digitalWrite(PIN_AVISO, GPIO.HIGH if nivel else GPIO.LOW)
+
+
+def avisar_gpio(estado):
+	secuencia = secuencia_para_estado(estado)
+	if not secuencia:
+		return
+	with gpio_lock:
+		try:
+			preparar_gpio()
+			reproducir_secuencia(secuencia, escribir_gpio, time.sleep)
+			print("Aviso GPIO", estado)
+		except Exception as error:
+			global gpio_listo
+			gpio_listo = False
+			print("No se pudo mover el pin de aviso", error)
+
+
 def record_result(result):
 	body = json.dumps(result, ensure_ascii=False)
 	atomic_write(RESULT_FILE, body + "\n")
@@ -351,6 +413,7 @@ def process_queue_once():
 		})
 		record_result(result)
 		drop_item(item)
+		avisar_gpio(result["estado"])
 		return True
 	parsed = parse_asistencia_row(row)
 	if not parsed:
@@ -366,12 +429,14 @@ def process_queue_once():
 		})
 		record_result(result)
 		drop_item(item)
+		avisar_gpio(result["estado"])
 		return True
 	result = resultado_base(item)
 	result.update(parsed)
 	result["estado"] = "registrada"
 	record_result(result)
 	drop_item(item)
+	avisar_gpio(result["estado"])
 	return True
 
 

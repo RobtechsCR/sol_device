@@ -89,6 +89,9 @@ class AsistenciaTest(unittest.TestCase):
 		nfc.UNIDAD_FILE = os.path.join(self.directory, "unidad_srv.txt")
 		nfc.GPS_FILE = os.path.join(self.directory, "gps.txt")
 		nfc.DB_CONFIG_FILE = os.path.join(self.directory, "sos_db.txt")
+		self.avisos = []
+		self.original["avisar_gpio"] = nfc.avisar_gpio
+		nfc.avisar_gpio = self.avisos.append
 
 	def tearDown(self):
 		for key, value in self.original.items():
@@ -149,6 +152,7 @@ class AsistenciaTest(unittest.TestCase):
 		with open(nfc.RESULT_FILE, "r") as handle:
 			saved = json.loads(handle.read())
 		self.assertEqual(saved["estado"], "registrada")
+		self.assertEqual(self.avisos, ["registrada"])
 		self.assertEqual(saved["attendance_id"], "att_0fb53bd2bb8111f1")
 		self.assertEqual(saved["accuracy_meters"], 10)
 		self.assertEqual(saved["lat"], 9.93)
@@ -164,6 +168,7 @@ class AsistenciaTest(unittest.TestCase):
 		with open(nfc.RESULT_FILE, "r") as handle:
 			saved = json.loads(handle.read())
 		self.assertEqual(saved["estado"], "rechazada")
+		self.assertEqual(self.avisos, ["rechazada"])
 		self.assertEqual(saved["mensaje"], "Tarjeta no autorizada")
 
 	def test_sin_conexion_conserva_la_cola(self):
@@ -174,7 +179,33 @@ class AsistenciaTest(unittest.TestCase):
 		item = nfc.nueva_lectura("a36f48n9", "15", 9.9, -84.0, "2026-09-28 10:00:02")
 		nfc.save_queue([item])
 		self.assertFalse(nfc.process_queue_once())
+		self.assertEqual(self.avisos, [])
 		self.assertEqual(nfc.load_queue()[0]["codigo"], "a36f48n9")
+
+	def test_parpadeo_valido_son_dos_pulsos(self):
+		niveles = []
+
+		def escribir(nivel):
+			niveles.append(nivel)
+
+		esperas = []
+		nfc.reproducir_secuencia(nfc.SECUENCIA_VALIDA, escribir, esperas.append)
+		self.assertEqual(niveles, [1, 0, 1, 0])
+		self.assertEqual(esperas, [0.5, 0.5, 0.5])
+
+	def test_parpadeo_invalido_son_cinco_pulsos(self):
+		niveles = []
+
+		def escribir(nivel):
+			niveles.append(nivel)
+
+		esperas = []
+		nfc.reproducir_secuencia(nfc.SECUENCIA_INVALIDA, escribir, esperas.append)
+		self.assertEqual(niveles, [1, 0, 1, 0, 1, 0, 1, 0, 1, 0])
+		self.assertEqual(esperas, [0.2, 0.5, 0.2, 0.5, 0.2, 0.5, 0.2, 0.5, 0.2])
+
+	def test_sin_red_no_tiene_secuencia(self):
+		self.assertEqual(nfc.secuencia_para_estado("sin_datos"), ())
 
 	def test_espera_si_falta_el_numero_de_bus(self):
 		nfc.save_queue([nfc.nueva_lectura("a36f48n9", "", 0, 0, "2026-09-28 10:00:03")])
