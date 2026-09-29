@@ -2,6 +2,7 @@ import csv
 import datetime
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -19,22 +20,35 @@ DB_CONFIG_FILE = os.path.join(BASE_DIR, "sos_db.txt")
 QUEUE_FILE = os.path.join(BASE_DIR, "asistencia_pendiente.txt")
 RESULT_FILE = os.path.join(BASE_DIR, "asistencia.txt")
 RESULT_LOG = os.path.join(BASE_DIR, "asistencia_log.txt")
+LOCAL_DB = os.path.join(BASE_DIR, "nfc_local.db")
 BURST_SECONDS = 1.0
 DUPLICATE_SECONDS = 2.0
 DEFAULT_ACCURACY_METERS = 10
-# Pin fisico 7 del conector. wiringPiSetup(), igual que gpio.py, usa el numero wPi.
-# En Orange Pi 5 ese pin es wPi 2 (GPIO 54, PWM15). En el conector H5 tambien es wPi 2 (PWM.1).
-PIN_AVISO = 2
-SECUENCIA_VALIDA = ((0.5, 1), (0.5, 0), (0.5, 1))
-SECUENCIA_INVALIDA = (
-	(0.2, 1), (0.5, 0),
-	(0.2, 1), (0.5, 0),
-	(0.2, 1), (0.5, 0),
-	(0.2, 1), (0.5, 0),
-	(0.2, 1),
+# wiringPiSetup(), igual que gpio.py, usa numeros wPi y no el numero fisico del conector.
+# Pin fisico 7: wPi 2, buzzer. Pin fisico 11: wPi 5, LED verde. Pin fisico 13: wPi 7, LED rojo.
+PIN_BUZZER = 2
+PIN_LED_VERDE = 5
+PIN_LED_ROJO = 7
+PINES = {
+	"buzzer": PIN_BUZZER,
+	"verde": PIN_LED_VERDE,
+	"rojo": PIN_LED_ROJO,
+}
+PITIDO_CORTO = 0.15
+PAUSA_ENTRE_PITIDOS = 0.1
+LED_VERDE_SEGUNDOS = 1.5
+PITIDO_LARGO = 2.0
+PASES_DIARIOS = 2
+VENTANA_MISMO_VIAJE = 20 * 60
+SYNC_SECONDS = 3600
+PASSENGER_DB = "turintel_turismointel"
+PASSENGER_SQL = (
+	"SELECT nfc_code FROM passenger "
+	"WHERE nfc_code IS NOT NULL AND TRIM(nfc_code) <> ''"
 )
 gpio_listo = False
-gpio_lock = threading.Lock()
+aviso_generacion = 0
+aviso_lock = threading.Lock()
 soap_client = None
 SOS_DB_HOST = "45.32.7.136"
 SOS_DB_PORT = 3306
@@ -48,8 +62,59 @@ ASISTENCIA_FIELDS = (
 	"fecha_servicio",
 )
 CALL_SQL = "CALL proc_registrar_asistencia_entrada(%s, %s, %s, %s, %s)"
+LOCAL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pasajero_nfc (
+	nfc_code TEXT PRIMARY KEY COLLATE NOCASE
+);
+CREATE TABLE IF NOT EXISTS pase_diario (
+	nfc_code TEXT NOT NULL COLLATE NOCASE,
+	fecha TEXT NOT NULL,
+	pases INTEGER NOT NULL,
+	ultimo_aceptado TEXT,
+	PRIMARY KEY (nfc_code, fecha)
+);
+CREATE TABLE IF NOT EXISTS cola_envio (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	nfc_code TEXT NOT NULL,
+	bus TEXT,
+	lat REAL,
+	lng REAL,
+	accuracy INTEGER,
+	fecha TEXT NOT NULL,
+	motivo TEXT NOT NULL,
+	estado TEXT NOT NULL DEFAULT 'pendiente'
+);
+CREATE INDEX IF NOT EXISTS idx_cola_estado ON cola_envio (estado, id);
+CREATE TABLE IF NOT EXISTS envio_tarjeta (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	cola_id INTEGER,
+	nfc_code TEXT NOT NULL,
+	bus TEXT,
+	lat REAL,
+	lng REAL,
+	accuracy INTEGER,
+	fecha_lectura TEXT,
+	fecha_envio TEXT,
+	motivo TEXT,
+	estado TEXT,
+	attendance_id TEXT,
+	horario_id TEXT,
+	duplicate TEXT,
+	mensaje TEXT,
+	empresa_id TEXT,
+	fecha_servicio TEXT
+);
+CREATE TABLE IF NOT EXISTS meta (
+	clave TEXT PRIMARY KEY,
+	valor TEXT
+);
+"""
 queue_lock = threading.Lock()
+db_lock = threading.Lock()
+local_conn = None
+local_path = None
 worker_started = False
+sync_started = False
 SPECIFIC_HINTS = ("rfid", "nfc", "mifare", "barcode", "reader", "card", "sycreader", "proximity")
 GENERIC_HINTS = ("hid",)
 
@@ -116,6 +181,21 @@ def timestamp():
 		return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def fecha_dia(stamp):
+	text = "" if stamp is None else str(stamp)
+	return text[:10]
+
+
+def segundos_entre(inicio, fin):
+	try:
+		fmt = "%Y-%m-%d %H:%M:%S"
+		a = datetime.datetime.strptime(str(inicio), fmt)
+		b = datetime.datetime.strptime(str(fin), fmt)
+	except (TypeError, ValueError):
+		return None
+	return (b - a).total_seconds()
+
+
 def parse_db_config(text):
 	found = {}
 	for line in str(text).splitlines():
@@ -124,8 +204,15 @@ def parse_db_config(text):
 			continue
 		key, value = line.split("=", 1)
 		key = key.strip().lower()
-		if key in ("host", "port", "user", "password", "database"):
-			found[key] = value.strip()
+		value = value.strip()
+		if key == "pases_diarios":
+			if value:
+				found[key] = int(value)
+		elif key == "passenger_database":
+			if value:
+				found[key] = value
+		elif key in ("host", "port", "user", "password", "database"):
+			found[key] = value
 	if "port" in found and found["port"]:
 		found["port"] = int(found["port"])
 	return found
@@ -138,6 +225,8 @@ def db_config():
 		"user": "",
 		"password": "",
 		"database": SOS_DB_NAME,
+		"passenger_database": PASSENGER_DB,
+		"pases_diarios": PASES_DIARIOS,
 	}
 	try:
 		with open(DB_CONFIG_FILE, "r") as handle:
@@ -145,6 +234,16 @@ def db_config():
 	except OSError:
 		pass
 	return config
+
+
+def pases_diarios():
+	try:
+		limite = int(db_config().get("pases_diarios", PASES_DIARIOS))
+	except (TypeError, ValueError):
+		return PASES_DIARIOS
+	if limite < 1:
+		return PASES_DIARIOS
+	return limite
 
 
 def normalizar_bus(value):
@@ -286,6 +385,48 @@ def error_mensaje(error):
 	return str(error)
 
 
+def decidir_tarjeta(autorizada, pases_hoy, segundos_desde_ultimo, limite=PASES_DIARIOS, ventana_seg=VENTANA_MISMO_VIAJE):
+	if not autorizada:
+		return {"feedback": "rechazada", "motivo": "no_autorizada", "incrementar": False}
+	if segundos_desde_ultimo is not None and 0 <= segundos_desde_ultimo < ventana_seg:
+		return {"feedback": "aceptada", "motivo": "mismo_viaje", "incrementar": False}
+	if pases_hoy >= limite:
+		return {"feedback": "rechazada", "motivo": "exceso_pases", "incrementar": False}
+	return {"feedback": "aceptada", "motivo": "aceptada", "incrementar": True}
+
+
+def cerrar_local():
+	global local_conn, local_path
+	with db_lock:
+		if local_conn is not None:
+			try:
+				local_conn.close()
+			except sqlite3.Error:
+				pass
+		local_conn = None
+		local_path = None
+
+
+def local_db():
+	global local_conn, local_path
+	if local_conn is not None and local_path == LOCAL_DB:
+		return local_conn
+	if local_conn is not None:
+		try:
+			local_conn.close()
+		except sqlite3.Error:
+			pass
+		local_conn = None
+	os.makedirs(os.path.dirname(LOCAL_DB), exist_ok=True)
+	local_conn = sqlite3.connect(LOCAL_DB, timeout=30, check_same_thread=False, isolation_level=None)
+	local_conn.row_factory = sqlite3.Row
+	local_conn.execute("PRAGMA journal_mode=WAL")
+	local_conn.execute("PRAGMA synchronous=FULL")
+	local_conn.executescript(LOCAL_SCHEMA)
+	local_path = LOCAL_DB
+	return local_conn
+
+
 def load_queue():
 	try:
 		with open(QUEUE_FILE, "r") as handle:
@@ -319,23 +460,250 @@ def enqueue_asistencia(codigo):
 		items = load_queue()
 		items.append(item)
 		save_queue(items)
-	print("Asistencia en cola " + item["codigo"])
+	print("Asistencia en archivo " + item["codigo"])
 	return item
 
 
-def secuencia_para_estado(estado):
-	if estado == "registrada":
-		return SECUENCIA_VALIDA
+def absorber_respaldo():
+	items = load_queue()
+	if not items:
+		return 0
+	with db_lock:
+		conn = local_db()
+		conn.execute("BEGIN IMMEDIATE")
+		try:
+			for item in items:
+				codigo = "" if item.get("codigo") is None else str(item.get("codigo")).strip()
+				if not codigo:
+					continue
+				conn.execute(
+					"""INSERT INTO cola_envio
+					(nfc_code, bus, lat, lng, accuracy, fecha, motivo, estado)
+					VALUES (?, ?, ?, ?, ?, ?, 'pendiente_archivo', 'pendiente')""",
+					(
+						codigo,
+						str(item.get("bus") or ""),
+						float(item.get("lat") or 0),
+						float(item.get("lng") or 0),
+						int(item.get("accuracy") or DEFAULT_ACCURACY_METERS),
+						item.get("fecha") or timestamp(),
+					),
+				)
+			conn.commit()
+		except Exception:
+			conn.rollback()
+			raise
+	save_queue([])
+	print("Cola recuperada " + str(len(items)))
+	return len(items)
+
+
+def reemplazar_pasajeros(codes):
+	limpios = []
+	vistos = set()
+	for code in codes:
+		text = "" if code is None else str(code).strip()
+		if not text:
+			continue
+		clave = text.casefold()
+		if clave in vistos:
+			continue
+		vistos.add(clave)
+		limpios.append(text)
+	with db_lock:
+		conn = local_db()
+		conn.execute("BEGIN IMMEDIATE")
+		try:
+			conn.execute("DELETE FROM pasajero_nfc")
+			if limpios:
+				conn.executemany(
+					"INSERT INTO pasajero_nfc (nfc_code) VALUES (?)",
+					[(code,) for code in limpios],
+				)
+			conn.execute(
+				"INSERT OR REPLACE INTO meta (clave, valor) VALUES ('ultima_sync', ?)",
+				(timestamp(),),
+			)
+			conn.commit()
+		except Exception:
+			conn.rollback()
+			raise
+	print("Tarjetas autorizadas " + str(len(limpios)))
+	return len(limpios)
+
+
+def tarjeta_autorizada(codigo):
+	with db_lock:
+		row = local_db().execute(
+			"SELECT 1 FROM pasajero_nfc WHERE nfc_code = ?",
+			(codigo,),
+		).fetchone()
+		return row is not None
+
+
+def pases_en(codigo, fecha):
+	with db_lock:
+		row = local_db().execute(
+			"SELECT pases FROM pase_diario WHERE nfc_code = ? AND fecha = ?",
+			(codigo, fecha),
+		).fetchone()
+		return 0 if row is None else int(row["pases"])
+
+
+def listar_pendientes():
+	with db_lock:
+		rows = local_db().execute(
+			"SELECT id, nfc_code, bus, motivo, estado FROM cola_envio WHERE estado = 'pendiente' ORDER BY id"
+		).fetchall()
+		return [dict(row) for row in rows]
+
+
+def listar_envios():
+	with db_lock:
+		rows = local_db().execute(
+			"SELECT * FROM envio_tarjeta ORDER BY id"
+		).fetchall()
+		return [dict(row) for row in rows]
+
+
+def estado_pase(conn, codigo, dia):
+	row = conn.execute(
+		"SELECT pases, ultimo_aceptado FROM pase_diario WHERE nfc_code = ? AND fecha = ?",
+		(codigo, dia),
+	).fetchone()
+	pases = 0 if row is None else int(row["pases"])
+	ultimo = None if row is None else row["ultimo_aceptado"]
+	if not ultimo:
+		previo = conn.execute(
+			"""SELECT ultimo_aceptado FROM pase_diario
+			WHERE nfc_code = ? AND ultimo_aceptado IS NOT NULL AND ultimo_aceptado <> ''
+			ORDER BY ultimo_aceptado DESC LIMIT 1""",
+			(codigo,),
+		).fetchone()
+		if previo is not None:
+			ultimo = previo["ultimo_aceptado"]
+	return pases, ultimo, row is not None
+
+
+def registrar_lectura_local(codigo, bus, lat, lng, accuracy, ahora):
+	dia = fecha_dia(ahora)
+	limite = pases_diarios()
+	with db_lock:
+		conn = local_db()
+		conn.execute("BEGIN IMMEDIATE")
+		try:
+			autorizada = conn.execute(
+				"SELECT 1 FROM pasajero_nfc WHERE nfc_code = ?",
+				(codigo,),
+			).fetchone() is not None
+			pases, ultimo, existe = estado_pase(conn, codigo, dia)
+			segundos = segundos_entre(ultimo, ahora) if ultimo else None
+			if segundos is not None and segundos < 0:
+				segundos = None
+			decision = decidir_tarjeta(autorizada, pases, segundos, limite, VENTANA_MISMO_VIAJE)
+			if decision["incrementar"]:
+				if existe:
+					conn.execute(
+						"""UPDATE pase_diario
+						SET pases = pases + 1, ultimo_aceptado = ?
+						WHERE nfc_code = ? AND fecha = ?""",
+						(ahora, codigo, dia),
+					)
+				else:
+					conn.execute(
+						"""INSERT INTO pase_diario (nfc_code, fecha, pases, ultimo_aceptado)
+						VALUES (?, ?, 1, ?)""",
+						(codigo, dia, ahora),
+					)
+			cur = conn.execute(
+				"""INSERT INTO cola_envio
+				(nfc_code, bus, lat, lng, accuracy, fecha, motivo, estado)
+				VALUES (?, ?, ?, ?, ?, ?, ?, 'pendiente')""",
+				(
+					codigo,
+					"" if bus is None else str(bus),
+					float(lat or 0),
+					float(lng or 0),
+					int(accuracy),
+					ahora,
+					decision["motivo"],
+				),
+			)
+			decision["cola_id"] = cur.lastrowid
+			conn.commit()
+		except Exception:
+			conn.rollback()
+			raise
+		return decision
+
+
+def construir_patron(estado):
+	if estado == "aceptada":
+		pitidos = PITIDO_CORTO + PAUSA_ENTRE_PITIDOS + PITIDO_CORTO
+		resto_verde = LED_VERDE_SEGUNDOS - pitidos
+		if resto_verde < 0:
+			resto_verde = 0
+		return [
+			(0, "buzzer", 1),
+			(PITIDO_CORTO, "buzzer", 0),
+			(PAUSA_ENTRE_PITIDOS, "verde", 1),
+			(0, "buzzer", 1),
+			(PITIDO_CORTO, "buzzer", 0),
+			(PAUSA_ENTRE_PITIDOS, "buzzer", 1),
+			(PITIDO_CORTO, "buzzer", 0),
+			(resto_verde, "verde", 0),
+		]
 	if estado == "rechazada":
-		return SECUENCIA_INVALIDA
-	return ()
+		return [
+			(0, "buzzer", 1),
+			(PITIDO_CORTO, "buzzer", 0),
+			(PAUSA_ENTRE_PITIDOS, "rojo", 1),
+			(0, "buzzer", 1),
+			(PITIDO_LARGO, "buzzer", 0),
+			(0, "rojo", 0),
+		]
+	return []
 
 
-def reproducir_secuencia(secuencia, escribir, esperar):
-	for duracion, nivel in secuencia:
-		escribir(nivel)
-		esperar(duracion)
-	escribir(0)
+def aviso_vigente(generacion):
+	return generacion == aviso_generacion
+
+
+def esperar_cancelable(segundos, generacion, esperar):
+	restante = float(segundos)
+	while restante > 0:
+		if not aviso_vigente(generacion):
+			return False
+		paso = min(0.05, restante)
+		esperar(paso)
+		restante -= paso
+	return aviso_vigente(generacion)
+
+
+def aplicar_nivel(pin, nivel, generacion, escribir):
+	with aviso_lock:
+		if generacion != aviso_generacion:
+			return False
+		escribir(pin, nivel)
+		return True
+
+
+def reproducir_patron(acciones, generacion, escribir, esperar, preparar):
+	global gpio_listo
+	try:
+		preparar()
+	except Exception as error:
+		gpio_listo = False
+		print("No se pudo preparar el aviso", error)
+		return
+	for pin in (PIN_BUZZER, PIN_LED_VERDE, PIN_LED_ROJO):
+		if not aplicar_nivel(pin, 0, generacion, escribir):
+			return
+	for espera, nombre, nivel in acciones:
+		if espera and not esperar_cancelable(espera, generacion, esperar):
+			return
+		if not aplicar_nivel(PINES[nombre], nivel, generacion, escribir):
+			return
 
 
 def preparar_gpio():
@@ -346,30 +714,46 @@ def preparar_gpio():
 	from wiringpi import GPIO
 	if wiringpi.wiringPiSetup() == -1:
 		raise RuntimeError("wiringPiSetup no pudo iniciar")
-	wiringpi.pinMode(PIN_AVISO, GPIO.OUTPUT)
-	wiringpi.digitalWrite(PIN_AVISO, GPIO.LOW)
+	for pin in (PIN_BUZZER, PIN_LED_VERDE, PIN_LED_ROJO):
+		wiringpi.pinMode(pin, GPIO.OUTPUT)
+		wiringpi.digitalWrite(pin, GPIO.LOW)
 	gpio_listo = True
 
 
-def escribir_gpio(nivel):
+def escribir_pin(pin, nivel):
 	import wiringpi
 	from wiringpi import GPIO
-	wiringpi.digitalWrite(PIN_AVISO, GPIO.HIGH if nivel else GPIO.LOW)
+	wiringpi.digitalWrite(pin, GPIO.HIGH if nivel else GPIO.LOW)
 
 
-def avisar_gpio(estado):
-	secuencia = secuencia_para_estado(estado)
-	if not secuencia:
+def iniciar_aviso(estado):
+	global aviso_generacion
+	acciones = construir_patron(estado)
+	if not acciones:
 		return
-	with gpio_lock:
-		try:
-			preparar_gpio()
-			reproducir_secuencia(secuencia, escribir_gpio, time.sleep)
-			print("Aviso GPIO", estado)
-		except Exception as error:
-			global gpio_listo
-			gpio_listo = False
-			print("No se pudo mover el pin de aviso", error)
+	with aviso_lock:
+		aviso_generacion += 1
+		generacion = aviso_generacion
+	threading.Thread(
+		target=reproducir_patron,
+		args=(acciones, generacion, escribir_pin, time.sleep, preparar_gpio),
+		name="aviso-nfc",
+		daemon=True,
+	).start()
+
+
+def simular_patron(estado):
+	reloj = {"ms": 0}
+	eventos = []
+
+	def escribir(pin, nivel):
+		eventos.append((reloj["ms"] / 1000.0, pin, nivel))
+
+	def esperar(segundos):
+		reloj["ms"] += int(round(float(segundos) * 1000))
+
+	reproducir_patron(construir_patron(estado), aviso_generacion, escribir, esperar, lambda: None)
+	return eventos
 
 
 def record_result(result):
@@ -381,23 +765,52 @@ def record_result(result):
 	print(result.get("estado", ""), result.get("mensaje", ""), result.get("tarjeta", ""))
 
 
-def connect_sos():
+def connect_mysql(database):
 	import pymysql
 	config = db_config()
 	if not config.get("user"):
-		raise RuntimeError("Falta el usuario de la base sos en " + DB_CONFIG_FILE)
+		raise RuntimeError("Falta el usuario de MySQL en " + DB_CONFIG_FILE)
 	return pymysql.connect(
 		host=config["host"],
 		port=int(config["port"]),
 		user=config["user"],
 		password=config["password"],
-		database=config["database"],
+		database=database,
 		connect_timeout=5,
 		read_timeout=8,
 		write_timeout=8,
 		autocommit=True,
 		charset="utf8mb4",
 	)
+
+
+def connect_sos():
+	return connect_mysql(db_config()["database"])
+
+
+def connect_passenger():
+	return connect_mysql(db_config()["passenger_database"])
+
+
+def fetch_passenger_codes():
+	connection = connect_passenger()
+	try:
+		with connection.cursor() as cursor:
+			cursor.execute(PASSENGER_SQL)
+			rows = cursor.fetchall()
+	finally:
+		connection.close()
+	codes = []
+	for row in rows:
+		value = row.get("nfc_code") if isinstance(row, dict) else row[0]
+		if value is not None and str(value).strip():
+			codes.append(str(value).strip())
+	return codes
+
+
+def sincronizar_pasajeros():
+	codes = fetch_passenger_codes()
+	return reemplazar_pasajeros(codes)
 
 
 def fetch_asistencia(cursor, item):
@@ -417,19 +830,6 @@ def call_registrar(item):
 		connection.close()
 
 
-def drop_item(item):
-	with queue_lock:
-		items = load_queue()
-		remaining = []
-		removed = False
-		for current in items:
-			if not removed and current.get("codigo") == item.get("codigo") and current.get("fecha") == item.get("fecha"):
-				removed = True
-				continue
-			remaining.append(current)
-		save_queue(remaining)
-
-
 def resultado_base(item):
 	return {
 		"tarjeta": item.get("codigo", ""),
@@ -438,64 +838,118 @@ def resultado_base(item):
 		"lng": item.get("lng", 0),
 		"accuracy_meters": int(item.get("accuracy", DEFAULT_ACCURACY_METERS)),
 		"fecha": item.get("fecha", ""),
+		"motivo": item.get("motivo", ""),
 	}
 
 
+def tomar_pendiente():
+	with db_lock:
+		row = local_db().execute(
+			"""SELECT id, nfc_code, bus, lat, lng, accuracy, fecha, motivo
+			FROM cola_envio WHERE estado = 'pendiente' ORDER BY id LIMIT 1"""
+		).fetchone()
+		if row is None:
+			return None
+		return {
+			"id": row["id"],
+			"codigo": row["nfc_code"],
+			"bus": row["bus"] or "",
+			"lat": row["lat"] or 0,
+			"lng": row["lng"] or 0,
+			"accuracy": DEFAULT_ACCURACY_METERS if row["accuracy"] is None else int(row["accuracy"]),
+			"fecha": row["fecha"],
+			"motivo": row["motivo"] or "",
+		}
+
+
+def fijar_bus(cola_id, bus):
+	with db_lock:
+		local_db().execute("UPDATE cola_envio SET bus = ? WHERE id = ?", (bus, cola_id))
+
+
+def guardar_respuesta(item, estado, mensaje, parsed=None):
+	campos = {key: "" for key in ASISTENCIA_FIELDS}
+	if parsed:
+		campos.update(parsed)
+	if mensaje is None:
+		mensaje = campos.get("mensaje", "")
+	else:
+		campos["mensaje"] = mensaje
+	with db_lock:
+		conn = local_db()
+		conn.execute("BEGIN IMMEDIATE")
+		try:
+			conn.execute(
+				"""INSERT INTO envio_tarjeta (
+					cola_id, nfc_code, bus, lat, lng, accuracy,
+					fecha_lectura, fecha_envio, motivo, estado,
+					attendance_id, horario_id, duplicate, mensaje, empresa_id, fecha_servicio
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+				(
+					item.get("id"),
+					item.get("codigo", ""),
+					item.get("bus", ""),
+					item.get("lat", 0),
+					item.get("lng", 0),
+					int(item.get("accuracy", DEFAULT_ACCURACY_METERS)),
+					item.get("fecha", ""),
+					timestamp(),
+					item.get("motivo", ""),
+					estado,
+					campos.get("attendance_id", ""),
+					campos.get("horario_id", ""),
+					campos.get("duplicate", ""),
+					mensaje,
+					campos.get("empresa_id", ""),
+					campos.get("fecha_servicio", ""),
+				),
+			)
+			if item.get("id") is not None:
+				conn.execute("UPDATE cola_envio SET estado = 'enviado' WHERE id = ?", (item["id"],))
+			conn.commit()
+		except Exception:
+			conn.rollback()
+			raise
+	result = resultado_base(item)
+	result.update(campos)
+	result["estado"] = estado
+	result["mensaje"] = mensaje
+	try:
+		record_result(result)
+	except OSError as error:
+		print(error)
+
+
 def process_queue_once():
-	with queue_lock:
-		items = load_queue()
-	if not items:
+	try:
+		absorber_respaldo()
+	except Exception as error:
+		print("No se pudo recuperar la cola", error)
+	item = tomar_pendiente()
+	if not item:
 		return False
-	item = dict(items[0])
 	if not item.get("bus"):
-		item["bus"] = read_bus_numero()
-	if not item.get("bus"):
-		item["bus"] = consultar_unidad()
+		item["bus"] = read_bus_numero() or consultar_unidad()
 	if not item.get("bus"):
 		print("Asistencia en espera, falta el numero de bus")
 		return False
+	try:
+		fijar_bus(item["id"], item["bus"])
+	except Exception as error:
+		print(error)
 	try:
 		row = call_registrar(item)
 	except Exception as error:
 		if not is_tarjeta_rechazada(error):
 			print("No se pudo registrar asistencia", error)
 			return False
-		result = resultado_base(item)
-		result.update({
-			"estado": "rechazada",
-			"mensaje": error_mensaje(error),
-			"attendance_id": "",
-			"horario_id": "",
-			"duplicate": "",
-			"empresa_id": "",
-			"fecha_servicio": "",
-		})
-		record_result(result)
-		drop_item(item)
-		avisar_gpio(result["estado"])
+		guardar_respuesta(item, "rechazada", error_mensaje(error), None)
 		return True
 	parsed = parse_asistencia_row(row)
 	if not parsed:
-		result = resultado_base(item)
-		result.update({
-			"estado": "sin_datos",
-			"mensaje": "La base sos no devolvio la asistencia",
-			"attendance_id": "",
-			"horario_id": "",
-			"duplicate": "",
-			"empresa_id": "",
-			"fecha_servicio": "",
-		})
-		record_result(result)
-		drop_item(item)
-		avisar_gpio(result["estado"])
+		guardar_respuesta(item, "sin_datos", "La base sos no devolvio la asistencia", None)
 		return True
-	result = resultado_base(item)
-	result.update(parsed)
-	result["estado"] = "registrada"
-	record_result(result)
-	drop_item(item)
-	avisar_gpio(result["estado"])
+	guardar_respuesta(item, "registrada", None, parsed)
 	return True
 
 
@@ -513,6 +967,15 @@ def worker():
 		time.sleep(2)
 
 
+def sync_worker():
+	while True:
+		try:
+			sincronizar_pasajeros()
+		except Exception as error:
+			print("No se pudo actualizar las tarjetas autorizadas", error)
+		time.sleep(SYNC_SECONDS)
+
+
 def start_worker():
 	global worker_started
 	if worker_started:
@@ -522,6 +985,15 @@ def start_worker():
 	worker_started = True
 
 
+def start_sync_worker():
+	global sync_started
+	if sync_started:
+		return
+	thread = threading.Thread(target=sync_worker, name="sync-nfc", daemon=True)
+	thread.start()
+	sync_started = True
+
+
 def save_read(code):
 	stamp = timestamp()
 	atomic_write(LAST_FILE, "Tarjeta:" + code + ",Fecha: " + stamp + "\n")
@@ -529,10 +1001,20 @@ def save_read(code):
 		handle.write(stamp + " " + code + "\n")
 		handle.flush()
 	print("Tarjeta leida " + code)
+	lat, lng = read_position()
+	bus = read_bus_numero()
 	try:
-		enqueue_asistencia(code)
+		decision = registrar_lectura_local(code, bus, lat, lng, DEFAULT_ACCURACY_METERS, stamp)
 	except Exception as error:
 		print("No se pudo encolar la asistencia", error)
+		try:
+			enqueue_asistencia(code)
+		except Exception as segundo:
+			print(segundo)
+		iniciar_aviso("rechazada")
+		return
+	print(decision["motivo"] + " " + code)
+	iniciar_aviso(decision["feedback"])
 
 
 def configured_device():
@@ -729,7 +1211,12 @@ def read_loop(device, evdev_module):
 
 
 def main():
+	try:
+		local_db()
+	except Exception as error:
+		print("No se pudo abrir la base local", error)
 	start_worker()
+	start_sync_worker()
 	while True:
 		device = None
 		try:
