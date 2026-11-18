@@ -333,35 +333,100 @@ def en_predio():
 		return False
 
 
-def leer_contadores(path, campos):
+def ruta_ultimo(path):
+	return path + ".ultimo"
+
+
+def leer_texto(path):
 	try:
 		with open(path, "r") as handle:
-			filedata = handle.read()
+			return handle.read()
 	except OSError:
-		filedata = ""
+		return None
+
+
+def valores_marcados(texto, campos):
 	valores = {}
 	for campo in campos:
 		label = campo + ": "
+		pos = texto.find(label) if texto else -1
+		if pos < 0:
+			valores[campo] = None
+			continue
+		fin = texto.find("$$", pos + len(label))
+		if fin < 0:
+			valores[campo] = None
+			continue
 		try:
-			start = filedata.index(label) + len(label)
-			end = filedata.index("$$", start)
-			valores[campo] = int(filedata[start:end].strip())
-		except (ValueError, IndexError):
-			valores[campo] = 0
+			valores[campo] = int(texto[pos + len(label):fin].strip())
+		except ValueError:
+			valores[campo] = None
 	return valores
 
 
+def bases_leidas(valores, campos):
+	for campo in campos:
+		if campo.endswith("_Predio"):
+			continue
+		if valores.get(campo) is None:
+			return False
+	return True
+
+
+def completar(valores, campos):
+	return {campo: 0 if valores.get(campo) is None else int(valores[campo]) for campo in campos}
+
+
+def texto_contadores(campos, valores):
+	return "".join(campo + ": " + str(int(valores[campo])) + "$$" for campo in campos)
+
+
 def escribir_contadores(path, campos, valores):
-	body = "".join(campo + ": " + str(int(valores[campo])) + "$$" for campo in campos)
-	atomic_write(path, body)
+	atomic_write(path, texto_contadores(campos, valores))
+
+
+def leer_contadores(path, campos):
+	texto = leer_texto(path)
+	valores = valores_marcados(texto, campos)
+	if texto is not None and bases_leidas(valores, campos):
+		return completar(valores, campos)
+	ultimo = leer_texto(ruta_ultimo(path))
+	valores_ultimo = valores_marcados(ultimo, campos)
+	if ultimo is not None and bases_leidas(valores_ultimo, campos):
+		buenos = completar(valores_ultimo, campos)
+		print("Contadores restaurados desde " + ruta_ultimo(path))
+		escribir_contadores(path, campos, buenos)
+		return buenos
+	if texto is None:
+		return {campo: 0 for campo in campos}
+	print("No se reescriben los contadores de " + path)
+	return None
 
 
 def incrementar_contador(path, campos, normal, predio):
 	with contador_lock:
 		valores = leer_contadores(path, campos)
+		if valores is None:
+			return
 		campo = predio if en_predio() else normal
 		valores[campo] = int(valores.get(campo, 0)) + 1
+		escribir_contadores(ruta_ultimo(path), campos, valores)
 		escribir_contadores(path, campos, valores)
+
+
+def proteger_contadores():
+	for path, campos in ((ENTRADAS_PE, CAMPOS_PE), (ENTRADAS_PS, CAMPOS_PS)):
+		with contador_lock:
+			texto = leer_texto(path)
+			valores = valores_marcados(texto, campos)
+			if texto is not None and bases_leidas(valores, campos):
+				escribir_contadores(ruta_ultimo(path), campos, completar(valores, campos))
+				continue
+			ultimo = leer_texto(ruta_ultimo(path))
+			valores_ultimo = valores_marcados(ultimo, campos)
+			if ultimo is not None and bases_leidas(valores_ultimo, campos):
+				print("Contadores restaurados desde " + ruta_ultimo(path))
+				escribir_contadores(path, campos, completar(valores_ultimo, campos))
 
 
 def getval_se():
@@ -607,6 +672,7 @@ def incremeta_salidas_ps():
 
 
 def iniciar():
+	proteger_contadores()
 	global wiringpi
 	import wiringpi as modulo
 	from wiringpi import GPIO

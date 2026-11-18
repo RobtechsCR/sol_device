@@ -105,6 +105,22 @@ class PredioTest(unittest.TestCase):
 		self.assertEqual(webservice.get_salidas_pe_predio(), 0)
 		self.assertIn("GeneralEntradasPe: 5$$", texto)
 
+	def test_un_archivo_vacio_no_borra_la_copia(self):
+		self.escribir(gpio.ENTRADAS_PE, "GeneralEntradasPe: 142$$GeneralSalidasPe: 116$$")
+		gpio.proteger_contadores()
+		self.escribir(gpio.ENTRADAS_PE, "")
+		gpio.incremeta_entrada_pe()
+		self.assertEqual(webservice.get_entradas_pe(), 143)
+		self.assertEqual(webservice.get_salidas_pe(), 116)
+		with open(gpio.ENTRADAS_PE, "r") as handle:
+			self.assertIn("GeneralEntradasPe: 143$$", handle.read())
+
+	def test_un_archivo_ilegible_no_se_reescribe(self):
+		self.escribir(gpio.ENTRADAS_PE, "archivo danado")
+		gpio.incremeta_entrada_pe()
+		with open(gpio.ENTRADAS_PE, "r") as handle:
+			self.assertEqual(handle.read(), "archivo danado")
+
 	def test_en_predio_cuenta_aparte_y_conserva_el_anterior(self):
 		self.escribir(gpio.PREDIO_FILE, "1\n")
 		self.escribir(gpio.ENTRADAS_PE, "GeneralEntradasPe: 4$$GeneralSalidasPe: 2$$")
