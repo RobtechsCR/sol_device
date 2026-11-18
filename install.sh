@@ -24,6 +24,8 @@ port=3306
 user=
 password=
 database=sos
+passenger_database=turintel_turismointel
+pases_diarios=2
 EOF
 fi
 sudo apt install sqlite3
