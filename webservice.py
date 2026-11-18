@@ -17,7 +17,16 @@ FECHA_FILE = os.path.join(BASE_DIR, "fecha_srv.txt")
 UNIDAD_FILE = os.path.join(BASE_DIR, "unidad_srv.txt")
 ENTRADAS_PE = os.path.join(BASE_DIR, "data_barras_entradas_pe.txt")
 ENTRADAS_PS = os.path.join(BASE_DIR, "data_barras_entradas_ps.txt")
+PREDIO_FILE = os.path.join(BASE_DIR, "en_predio.txt")
+DB_CONFIG_FILE = os.path.join(BASE_DIR, "sos_db.txt")
 WSDL = "http://45.32.7.136:8080/WebServiceSOLV3-3/SolSrv?wsdl"
+SOS_DB_HOST = "45.32.7.136"
+SOS_DB_PORT = 3306
+SOS_DB_NAME = "sos"
+SQL_PREDIO = "SELECT esEnPredio(%s, %s)"
+CALL_TRANSMISION = (
+	"CALL insertarTranmision_v5(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+)
 timezone = pytz.timezone("America/Costa_Rica")
 
 client = None
@@ -151,6 +160,173 @@ def get_entradas_ps():
 	return read_marked(ENTRADAS_PS, "GeneralEntradasPs: ")
 
 
+def get_entradas_pe_predio():
+	return read_marked(ENTRADAS_PE, "GeneralEntradasPe_Predio: ")
+
+
+def get_salidas_pe_predio():
+	return read_marked(ENTRADAS_PE, "GeneralSalidasPe_Predio: ")
+
+
+def get_entradas_ps_predio():
+	return read_marked(ENTRADAS_PS, "GeneralEntradasPs_Predio: ")
+
+
+def get_salidas_ps_predio():
+	return read_marked(ENTRADAS_PS, "GeneralSalidasPs_Predio: ")
+
+
+def parse_db_config(text):
+	found = {}
+	for line in str(text).splitlines():
+		line = line.strip()
+		if not line or line.startswith("#") or "=" not in line:
+			continue
+		key, value = line.split("=", 1)
+		key = key.strip().lower()
+		if key in ("host", "port", "user", "password", "database"):
+			found[key] = value.strip()
+	if "port" in found and found["port"]:
+		found["port"] = int(found["port"])
+	return found
+
+
+def db_config():
+	config = {
+		"host": SOS_DB_HOST,
+		"port": SOS_DB_PORT,
+		"user": "",
+		"password": "",
+		"database": SOS_DB_NAME,
+	}
+	try:
+		with open(DB_CONFIG_FILE, "r") as handle:
+			config.update(parse_db_config(handle.read()))
+	except OSError:
+		pass
+	return config
+
+
+def connect_mysql():
+	import pymysql
+	config = db_config()
+	if not config.get("user"):
+		raise RuntimeError("Falta el usuario de MySQL en " + DB_CONFIG_FILE)
+	return pymysql.connect(
+		host=config["host"],
+		port=int(config["port"]),
+		user=config["user"],
+		password=config["password"],
+		database=config["database"],
+		connect_timeout=5,
+		read_timeout=8,
+		write_timeout=8,
+		autocommit=True,
+		charset="utf8mb4",
+	)
+
+
+def interpretar_predio(value):
+	if value is None:
+		return None
+	if isinstance(value, bool):
+		return value
+	if isinstance(value, (int, float)):
+		return int(value) == 1
+	text = str(value).strip()
+	if text in ("1", "True", "true"):
+		return True
+	if text in ("0", "False", "false"):
+		return False
+	return None
+
+
+def coordenadas_actuales():
+	lat = get_latitud()
+	lng = get_longitud()
+	try:
+		lat_n = float(lat)
+		lng_n = float(lng)
+	except (TypeError, ValueError):
+		return None
+	if lat_n == 0.0 and lng_n == 0.0:
+		return None
+	return str(lat), str(lng)
+
+
+def consultar_predio():
+	coords = coordenadas_actuales()
+	if coords is None:
+		return None
+	connection = connect_mysql()
+	try:
+		with connection.cursor() as cursor:
+			cursor.execute(SQL_PREDIO, coords)
+			row = cursor.fetchone()
+	finally:
+		connection.close()
+	if not row:
+		return None
+	value = row[0] if not isinstance(row, dict) else next(iter(row.values()))
+	return interpretar_predio(value)
+
+
+def leer_predio():
+	try:
+		with open(PREDIO_FILE, "r") as handle:
+			return handle.read().strip()
+	except OSError:
+		return ""
+
+
+def actualizar_predio():
+	estado = consultar_predio()
+	if estado is None:
+		return
+	nuevo = "1" if estado else "0"
+	if leer_predio() == nuevo:
+		return
+	atomic_write(PREDIO_FILE, nuevo + "\n")
+	print("En predio " + nuevo)
+
+
+def parametros_transmision():
+	now = datetime.datetime.now(timezone).strftime("%Y-%m-%d %H:%M:%S")
+	try:
+		km = float(getKM())
+	except (TypeError, ValueError):
+		km = 0.0
+	return (
+		now,
+		str(device_id()),
+		str(get_latitud()),
+		str(get_longitud()),
+		str(get_velocidad()),
+		str(get_entradas_pe()),
+		str(get_salidas_pe()),
+		str(get_entradas_ps()),
+		str(get_salidas_ps()),
+		km,
+		str(get_entradas_pe_predio()),
+		str(get_salidas_pe_predio()),
+		str(get_entradas_ps_predio()),
+		str(get_salidas_ps_predio()),
+	)
+
+
+def enviar_transmision(params):
+	connection = connect_mysql()
+	try:
+		with connection.cursor() as cursor:
+			cursor.execute(CALL_TRANSMISION, params)
+			try:
+				return cursor.fetchone()
+			except Exception:
+				return None
+	finally:
+		connection.close()
+
+
 def get_latitud():
 	try:
 		with open(GPS_FILE, "r") as handle:
@@ -198,29 +374,17 @@ def send_data_srv():
 		print(error)
 		reset_client()
 	try:
-		deviceid = device_id()
-		entradas = get_entradas_pe()
-		salidas = get_salidas_pe()
-		entradas_ps = get_entradas_ps()
-		salidas_ps = get_salidas_ps()
-		latitud = get_latitud()
-		longitud = get_longitud()
-		velocidad = get_velocidad()
-		km = getKM()
-		now = datetime.datetime.now(timezone)
-		result = get_client().service.insertarTransmisionConKM(
-			now, deviceid, latitud, longitud, velocidad, entradas, salidas, entradas_ps, salidas_ps, km
-		)
+		result = enviar_transmision(parametros_transmision())
 		print(result)
 	except Exception as error:
 		print(error)
-		reset_client()
 
 
 def main():
 	print("Device Id:" + device_id())
 	last_check = None
 	last_send = None
+	last_predio = None
 	last_fecha_ok = None
 	last_fecha_try = None
 	while True:
@@ -243,6 +407,13 @@ def main():
 				print(error)
 				reset_client()
 			last_check = time.monotonic()
+		now = time.monotonic()
+		if last_predio is None or now - last_predio >= 10:
+			try:
+				actualizar_predio()
+			except Exception as error:
+				print("No se pudo consultar el predio", error)
+			last_predio = time.monotonic()
 		now = time.monotonic()
 		if last_send is None or now - last_send >= 15:
 			send_data_srv()

@@ -27,9 +27,20 @@ CREATE TABLE if not exists monitoreo(
 	GeneralSalidasPe INTEGER not null,
 	GeneralEntradasPs INTEGER not null,
 	GeneralSalidasPs INTEGER not null,
-	SrvOnline VARCHAR(50) not null
+	SrvOnline VARCHAR(50) not null,
+	GeneralEntradasPe_Predio INTEGER not null DEFAULT 0,
+	GeneralSalidasPe_Predio INTEGER not null DEFAULT 0,
+	GeneralEntradasPs_Predio INTEGER not null DEFAULT 0,
+	GeneralSalidasPs_Predio INTEGER not null DEFAULT 0
 )
 """
+
+PREDIO_COLUMNS = (
+	"GeneralEntradasPe_Predio",
+	"GeneralSalidasPe_Predio",
+	"GeneralEntradasPs_Predio",
+	"GeneralSalidasPs_Predio",
+)
 
 
 def device_id():
@@ -64,10 +75,20 @@ def connect():
 	return con
 
 
+def ensure_predio_columns(con):
+	existing = {row[1] for row in con.execute("PRAGMA table_info(monitoreo)")}
+	for name in PREDIO_COLUMNS:
+		if name not in existing:
+			con.execute(
+				"ALTER TABLE monitoreo ADD COLUMN " + name + " INTEGER not null DEFAULT 0"
+			)
+
+
 def init_db():
 	con = connect()
 	try:
 		con.execute(CREATE_TABLE)
+		ensure_predio_columns(con)
 		con.commit()
 	finally:
 		con.close()
@@ -98,6 +119,22 @@ def get_entradas_pe():
 
 def get_entradas_ps():
 	return read_marked(ENTRADAS_PS, "GeneralEntradasPs: ")
+
+
+def get_entradas_pe_predio():
+	return read_marked(ENTRADAS_PE, "GeneralEntradasPe_Predio: ")
+
+
+def get_salidas_pe_predio():
+	return read_marked(ENTRADAS_PE, "GeneralSalidasPe_Predio: ")
+
+
+def get_entradas_ps_predio():
+	return read_marked(ENTRADAS_PS, "GeneralEntradasPs_Predio: ")
+
+
+def get_salidas_ps_predio():
+	return read_marked(ENTRADAS_PS, "GeneralSalidasPs_Predio: ")
 
 
 def read_gps_field(prefix, end_at_comma):
@@ -146,6 +183,10 @@ def save_data_sql():
 	salidas = get_salidas_pe()
 	entradas_ps = get_entradas_ps()
 	salidas_ps = get_salidas_ps()
+	entradas_pe_predio = get_entradas_pe_predio()
+	salidas_pe_predio = get_salidas_pe_predio()
+	entradas_ps_predio = get_entradas_ps_predio()
+	salidas_ps_predio = get_salidas_ps_predio()
 	latitud = get_latitud()
 	longitud = get_longitud()
 	velocidad = get_velocidad()
@@ -156,8 +197,16 @@ def save_data_sql():
 	try:
 		cur = con.cursor()
 		cur.execute(
-			"insert into monitoreo (Fecha, DeviceId, latitud, longitud, Velocidad, GeneralEntradasPe, GeneralSalidasPe, GeneralEntradasPs, GeneralSalidasPs, SrvOnline) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			(fecha, str(deviceid), latitud, longitud, velocidad, entradas, salidas, entradas_ps, salidas_ps, is_online),
+			"""insert into monitoreo (
+				Fecha, DeviceId, latitud, longitud, Velocidad,
+				GeneralEntradasPe, GeneralSalidasPe, GeneralEntradasPs, GeneralSalidasPs, SrvOnline,
+				GeneralEntradasPe_Predio, GeneralSalidasPe_Predio, GeneralEntradasPs_Predio, GeneralSalidasPs_Predio
+			) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+			(
+				fecha, str(deviceid), latitud, longitud, velocidad,
+				entradas, salidas, entradas_ps, salidas_ps, is_online,
+				entradas_pe_predio, salidas_pe_predio, entradas_ps_predio, salidas_ps_predio,
+			),
 		)
 		con.commit()
 		print("Respaldo guardado", fecha, deviceid, latitud, longitud, velocidad, is_online)

@@ -1,11 +1,10 @@
-import time, serial, wiringpi
-from wiringpi import GPIO
 import datetime
 
 import threading
 from time import sleep
 
 import os
+import tempfile
 
 global time_volumen_pe;
 time_volumen_pe=80;
@@ -15,6 +14,82 @@ global pe_validada
 pe_validada=0
 global pe_validada_ps
 pe_validada_ps=0
+BASE_DIR = "/home/orangepi/Documents"
+ENTRADAS_PE = os.path.join(BASE_DIR, "data_barras_entradas_pe.txt")
+ENTRADAS_PS = os.path.join(BASE_DIR, "data_barras_entradas_ps.txt")
+PREDIO_FILE = os.path.join(BASE_DIR, "en_predio.txt")
+CAMPOS_PE = (
+	"GeneralEntradasPe",
+	"GeneralSalidasPe",
+	"GeneralEntradasPe_Predio",
+	"GeneralSalidasPe_Predio",
+)
+CAMPOS_PS = (
+	"GeneralEntradasPs",
+	"GeneralSalidasPs",
+	"GeneralEntradasPs_Predio",
+	"GeneralSalidasPs_Predio",
+)
+contador_lock = threading.Lock()
+wiringpi = None
+
+
+def atomic_write(path, data):
+	os.makedirs(os.path.dirname(path), exist_ok=True)
+	fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+	try:
+		with os.fdopen(fd, "w") as handle:
+			handle.write(data)
+			handle.flush()
+			os.fsync(handle.fileno())
+		os.replace(tmp, path)
+	except Exception:
+		try:
+			os.unlink(tmp)
+		except OSError:
+			pass
+		raise
+
+
+def en_predio():
+	try:
+		with open(PREDIO_FILE, "r") as handle:
+			return handle.read().strip() == "1"
+	except OSError:
+		return False
+
+
+def leer_contadores(path, campos):
+	try:
+		with open(path, "r") as handle:
+			filedata = handle.read()
+	except OSError:
+		filedata = ""
+	valores = {}
+	for campo in campos:
+		label = campo + ": "
+		try:
+			start = filedata.index(label) + len(label)
+			end = filedata.index("$$", start)
+			valores[campo] = int(filedata[start:end].strip())
+		except (ValueError, IndexError):
+			valores[campo] = 0
+	return valores
+
+
+def escribir_contadores(path, campos, valores):
+	body = "".join(campo + ": " + str(int(valores[campo])) + "$$" for campo in campos)
+	atomic_write(path, body)
+
+
+def incrementar_contador(path, campos, normal, predio):
+	with contador_lock:
+		valores = leer_contadores(path, campos)
+		campo = predio if en_predio() else normal
+		valores[campo] = int(valores.get(campo, 0)) + 1
+		escribir_contadores(path, campos, valores)
+
+
 def getval_se():
 	
 	global val_se
@@ -244,100 +319,61 @@ def getval_bloqueo_ps():
 
 
 def incremeta_entrada_pe():
-	if os.path.isfile("/home/orangepi/Documents/data_barras_entradas_pe.txt"):
-		with open("/home/orangepi/Documents/data_barras_entradas_pe.txt",'r') as file:
-			filedata=file.read()
-		total_marcas_ant=int(filedata[filedata.index("GeneralEntradasPe: ")+19:filedata.index("$$")])
-		total_marcas_nue=int(filedata[filedata.index("GeneralEntradasPe: ")+19:filedata.index("$$")]) + 1
-		filedata = filedata.replace("GeneralEntradasPe: "+str(total_marcas_ant),"GeneralEntradasPe: "+str(total_marcas_nue))
-		with open("/home/orangepi/Documents/data_barras_entradas_pe.txt",'w') as file:
-			filedata=file.write(filedata)
-	else:
-		filedata = "GeneralEntradasPe: 1$$GeneralSalidasPe: 0$$"
-		with open("/home/orangepi/Documents/data_barras_entradas_pe.txt",'w') as file:
-			filedata=file.write(filedata)
+	incrementar_contador(ENTRADAS_PE, CAMPOS_PE, "GeneralEntradasPe", "GeneralEntradasPe_Predio")
 
 def incremeta_entrada_ps():
-	if os.path.isfile("/home/orangepi/Documents/data_barras_entradas_ps.txt"):
-		with open("/home/orangepi/Documents/data_barras_entradas_ps.txt",'r') as file:
-			filedata=file.read()
-		total_marcas_ant=int(filedata[filedata.index("GeneralEntradasPs: ")+19:filedata.index("$$")])
-		total_marcas_nue=int(filedata[filedata.index("GeneralEntradasPs: ")+19:filedata.index("$$")]) + 1
-		filedata = filedata.replace("GeneralEntradasPs: "+str(total_marcas_ant),"GeneralEntradasPs: "+str(total_marcas_nue))
-		with open("/home/orangepi/Documents/data_barras_entradas_ps.txt",'w') as file:
-			filedata=file.write(filedata)
-	else:
-		filedata = "GeneralEntradasPs: 1$$GeneralSalidasPs: 0$$"
-		with open("/home/orangepi/Documents/data_barras_entradas_ps.txt",'w') as file:
-			filedata=file.write(filedata)
+	incrementar_contador(ENTRADAS_PS, CAMPOS_PS, "GeneralEntradasPs", "GeneralEntradasPs_Predio")
 
 
 def incremeta_salidas_pe():
-	if os.path.isfile("/home/orangepi/Documents/data_barras_entradas_pe.txt"):
-		with open("/home/orangepi/Documents/data_barras_entradas_pe.txt",'r') as file:
-			filedata=file.read()
-		total_marcas_ant=int(filedata[filedata.index("GeneralSalidasPe: ")+18:filedata.index("$$",filedata.index("GeneralSalidasPe: "))])
-		total_marcas_nue=int(filedata[filedata.index("GeneralSalidasPe: ")+18:filedata.index("$$",filedata.index("GeneralSalidasPe: "))]) + 1
-		filedata = filedata.replace("GeneralSalidasPe: "+str(total_marcas_ant),"GeneralSalidasPe: "+str(total_marcas_nue))
-		with open("/home/orangepi/Documents/data_barras_entradas_pe.txt",'w') as file:
-			filedata=file.write(filedata)
-	else:
-		filedata = "GeneralEntradasPe: 0$$GeneralSalidasPe: 1$$"
-		with open("/home/orangepi/Documents/data_barras_entradas_pe.txt",'w') as file:
-			filedata=file.write(filedata)
+	incrementar_contador(ENTRADAS_PE, CAMPOS_PE, "GeneralSalidasPe", "GeneralSalidasPe_Predio")
 
 def incremeta_salidas_ps():
-	if os.path.isfile("/home/orangepi/Documents/data_barras_entradas_ps.txt"):
-		with open("/home/orangepi/Documents/data_barras_entradas_ps.txt",'r') as file:
-			filedata=file.read()
-		total_marcas_ant=int(filedata[filedata.index("GeneralSalidasPs: ")+18:filedata.index("$$",filedata.index("GeneralSalidasPs: "))])
-		total_marcas_nue=int(filedata[filedata.index("GeneralSalidasPs: ")+18:filedata.index("$$",filedata.index("GeneralSalidasPs: "))]) + 1
-		filedata = filedata.replace("GeneralSalidasPs: "+str(total_marcas_ant),"GeneralSalidasPs: "+str(total_marcas_nue))
-		with open("/home/orangepi/Documents/data_barras_entradas_ps.txt",'w') as file:
-			filedata=file.write(filedata)
-	else:
-		filedata = "GeneralEntradasPs: 0$$GeneralSalidasPs: 1$$"
-		with open("/home/orangepi/Documents/data_barras_entradas_ps.txt",'w') as file:
-			filedata=file.write(filedata)
+	incrementar_contador(ENTRADAS_PS, CAMPOS_PS, "GeneralSalidasPs", "GeneralSalidasPs_Predio")
 
 
-wiringpi.wiringPiSetup();
-wiringpi.pinMode(17, GPIO.INPUT)
-wiringpi.pinMode(19, GPIO.INPUT)
-wiringpi.pinMode(20, GPIO.INPUT)
-wiringpi.pinMode(11, GPIO.INPUT)
-wiringpi.pinMode(12, GPIO.INPUT)
-wiringpi.pinMode(14, GPIO.INPUT)
-evt_entradaspe=threading.Event()
-val_se="";
-t=threading.Thread(target=getval_se)
-t.start()
-evt_salidaspe=threading.Event()
-val_ss="";
-t2=threading.Thread(target=getval_ss)
-t2.start()
-evt_validadorpe=threading.Event()
-val_sv="";
-t3=threading.Thread(target=getval_sv)
-t3.start()
-evt_bloqueope=threading.Event()
-val_pe_bloqueo="";
-t4=threading.Thread(target=getval_bloqueo_pe)
-t4.start()
+def iniciar():
+	global wiringpi
+	import wiringpi as modulo
+	from wiringpi import GPIO
+	wiringpi = modulo
+	wiringpi.wiringPiSetup()
+	wiringpi.pinMode(17, GPIO.INPUT)
+	wiringpi.pinMode(19, GPIO.INPUT)
+	wiringpi.pinMode(20, GPIO.INPUT)
+	wiringpi.pinMode(11, GPIO.INPUT)
+	wiringpi.pinMode(12, GPIO.INPUT)
+	wiringpi.pinMode(14, GPIO.INPUT)
+	global evt_entradaspe, evt_salidaspe, evt_validadorpe, evt_bloqueope
+	global evt_entradasps, evt_salidasps, evt_validadorps, evt_bloqueops
+	global val_se, val_ss, val_sv, val_pe_bloqueo
+	global val_se_ps, val_ss_ps, val_sv_ps, val_ps_bloqueo
+	evt_entradaspe=threading.Event()
+	val_se=""
+	threading.Thread(target=getval_se).start()
+	evt_salidaspe=threading.Event()
+	val_ss=""
+	threading.Thread(target=getval_ss).start()
+	evt_validadorpe=threading.Event()
+	val_sv=""
+	threading.Thread(target=getval_sv).start()
+	evt_bloqueope=threading.Event()
+	val_pe_bloqueo=""
+	threading.Thread(target=getval_bloqueo_pe).start()
 
-evt_entradasps=threading.Event()
-val_se_ps="";
-t5=threading.Thread(target=getval_se_ps)
-t5.start()
-evt_salidasps=threading.Event()
-val_ss_ps="";
-t6=threading.Thread(target=getval_ss_ps)
-t6.start()
-evt_validadorps=threading.Event()
-val_sv_ps="";
-t7=threading.Thread(target=getval_sv_ps)
-t7.start()
-evt_bloqueops=threading.Event()
-val_ps_bloqueo="";
-t8=threading.Thread(target=getval_bloqueo_ps)
-t8.start()
+	evt_entradasps=threading.Event()
+	val_se_ps=""
+	threading.Thread(target=getval_se_ps).start()
+	evt_salidasps=threading.Event()
+	val_ss_ps=""
+	threading.Thread(target=getval_ss_ps).start()
+	evt_validadorps=threading.Event()
+	val_sv_ps=""
+	threading.Thread(target=getval_sv_ps).start()
+	evt_bloqueops=threading.Event()
+	val_ps_bloqueo=""
+	threading.Thread(target=getval_bloqueo_ps).start()
+
+
+if __name__ == "__main__":
+	iniciar()
