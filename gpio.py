@@ -373,10 +373,6 @@ def bases_leidas(valores, campos):
 	return True
 
 
-def completar(valores, campos):
-	return {campo: 0 if valores.get(campo) is None else int(valores[campo]) for campo in campos}
-
-
 def texto_contadores(campos, valores):
 	return "".join(campo + ": " + str(int(valores[campo])) + "$$" for campo in campos)
 
@@ -385,29 +381,58 @@ def escribir_contadores(path, campos, valores):
 	atomic_write(path, texto_contadores(campos, valores))
 
 
+def combinar_maximo(fuentes, campos):
+	salida = {}
+	for campo in campos:
+		mayor = None
+		for valores in fuentes:
+			if not valores or valores.get(campo) is None:
+				continue
+			valor = int(valores[campo])
+			if mayor is None or valor > mayor:
+				mayor = valor
+		salida[campo] = 0 if mayor is None else mayor
+	return salida
+
+
 def leer_contadores(path, campos):
 	texto = leer_texto(path)
 	valores = valores_marcados(texto, campos)
-	if texto is not None and bases_leidas(valores, campos):
-		return completar(valores, campos)
 	ultimo = leer_texto(ruta_ultimo(path))
 	valores_ultimo = valores_marcados(ultimo, campos)
+	fuentes = []
+	if texto is not None and bases_leidas(valores, campos):
+		fuentes.append(valores)
 	if ultimo is not None and bases_leidas(valores_ultimo, campos):
-		buenos = completar(valores_ultimo, campos)
-		print("Contadores restaurados desde " + ruta_ultimo(path))
+		fuentes.append(valores_ultimo)
+	if not fuentes:
+		if texto is None and ultimo is None:
+			return None
+		print("No se reescriben los contadores de " + path)
+		return None
+	buenos = combinar_maximo(fuentes, campos)
+	if texto != texto_contadores(campos, buenos):
+		bajo = False
+		if texto is not None and bases_leidas(valores, campos):
+			for campo in campos:
+				if valores.get(campo) is not None and int(valores[campo]) < buenos[campo]:
+					bajo = True
+		if bajo:
+			print("Contador conservado, no se permite reiniciar " + path)
+		elif not bases_leidas(valores, campos):
+			print("Contadores restaurados desde " + ruta_ultimo(path))
 		escribir_contadores(path, campos, buenos)
-		return buenos
-	if texto is None:
-		return {campo: 0 for campo in campos}
-	print("No se reescriben los contadores de " + path)
-	return None
+	return buenos
 
 
 def incrementar_contador(path, campos, normal, predio):
 	with contador_lock:
 		valores = leer_contadores(path, campos)
 		if valores is None:
-			return
+			if leer_texto(path) is None and leer_texto(ruta_ultimo(path)) is None:
+				valores = {campo: 0 for campo in campos}
+			else:
+				return
 		campo = predio if en_predio() else normal
 		valores[campo] = int(valores.get(campo, 0)) + 1
 		escribir_contadores(ruta_ultimo(path), campos, valores)
@@ -417,16 +442,11 @@ def incrementar_contador(path, campos, normal, predio):
 def proteger_contadores():
 	for path, campos in ((ENTRADAS_PE, CAMPOS_PE), (ENTRADAS_PS, CAMPOS_PS)):
 		with contador_lock:
-			texto = leer_texto(path)
-			valores = valores_marcados(texto, campos)
-			if texto is not None and bases_leidas(valores, campos):
-				escribir_contadores(ruta_ultimo(path), campos, completar(valores, campos))
+			valores = leer_contadores(path, campos)
+			if valores is None:
 				continue
-			ultimo = leer_texto(ruta_ultimo(path))
-			valores_ultimo = valores_marcados(ultimo, campos)
-			if ultimo is not None and bases_leidas(valores_ultimo, campos):
-				print("Contadores restaurados desde " + ruta_ultimo(path))
-				escribir_contadores(path, campos, completar(valores_ultimo, campos))
+			escribir_contadores(ruta_ultimo(path), campos, valores)
+			escribir_contadores(path, campos, valores)
 
 
 def getval_se():
