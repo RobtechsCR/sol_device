@@ -642,6 +642,10 @@ def get_velocidad():
 		return 0.0
 
 
+def texto_transmision(params):
+	return "Transmision enviada " + str(params[0]) + " " + str(params[2]) + "," + str(params[3]) + " vel " + str(params[4])
+
+
 def send_data_srv():
 	try:
 		print("Unidad Sol:" + getUnidad())
@@ -649,10 +653,11 @@ def send_data_srv():
 		print(error)
 		reset_client()
 	try:
-		result = enviar_transmision(parametros_transmision())
-		print(result)
+		params = parametros_transmision()
+		enviar_transmision(params)
+		print(texto_transmision(params))
 	except Exception as error:
-		print(error)
+		print("No se pudo transmitir", error)
 
 
 def main():

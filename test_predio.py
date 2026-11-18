@@ -51,6 +51,16 @@ class PredioTest(unittest.TestCase):
 		with open(path, "w") as handle:
 			handle.write(data)
 
+	def test_la_transmision_sin_respuesta_se_confirma(self):
+		params = (
+			"2026-11-18 16:43:59", "9d623d49", "9.904499", "-84.127016", "0.071",
+			"0", "0", "14", "85", 30092.5, "0", "0", "0", "0",
+		)
+		self.assertEqual(
+			webservice.texto_transmision(params),
+			"Transmision enviada 2026-11-18 16:43:59 9.904499,-84.127016 vel 0.071",
+		)
+
 	def test_cero_y_uno_del_servidor(self):
 		self.assertFalse(webservice.interpretar_predio(0))
 		self.assertTrue(webservice.interpretar_predio(1))
