@@ -19,6 +19,9 @@ CHATBOT_DB = "chatbot"
 SOS_DB_FILE = "/home/orangepi/Documents/sos_db.txt"
 SOS_DB_HOST = "45.32.7.136"
 SOS_DB_PORT = 3306
+SOS_DB_USER = "EROBLES"
+SOS_DB_PASSWORD = "LopezM5825"
+SOS_DB_NAME = "sos"
 _aviso_pendiente = None
 _aviso_enviado = False
 _importando = False
@@ -82,7 +85,42 @@ def instalar_modulo(nombre, ejecutar=None):
 	ejecutar([sys.executable, "-m", "pip", "install", paquete_pip(nombre)])
 
 
+def asegurar_sos_db(path=None):
+	path = path or SOS_DB_FILE
+	texto = ""
+	try:
+		with open(path, "r") as handle:
+			texto = handle.read()
+	except OSError:
+		texto = ""
+	datos = {}
+	for line in texto.splitlines():
+		line = line.strip()
+		if not line or line.startswith("#") or "=" not in line:
+			continue
+		key, value = line.split("=", 1)
+		datos[key.strip().lower()] = value.strip()
+	if datos.get("user"):
+		return
+	datos["host"] = datos.get("host") or SOS_DB_HOST
+	datos["port"] = datos.get("port") or str(SOS_DB_PORT)
+	datos["user"] = SOS_DB_USER
+	datos["password"] = datos.get("password") or SOS_DB_PASSWORD
+	datos["database"] = datos.get("database") or SOS_DB_NAME
+	directorio = os.path.dirname(path)
+	try:
+		if directorio:
+			os.makedirs(directorio, exist_ok=True)
+		contenido = "".join("%s=%s\n" % (key, datos[key]) for key in ("host", "port", "user", "password", "database"))
+		fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+		with os.fdopen(fd, "w") as handle:
+			handle.write(contenido)
+	except OSError:
+		return
+
+
 def config_chatbot():
+	asegurar_sos_db(SOS_DB_FILE)
 	config = {
 		"host": SOS_DB_HOST,
 		"port": SOS_DB_PORT,
@@ -428,6 +466,7 @@ def parse_db_config(text):
 
 
 def db_config():
+	asegurar_sos_db(DB_CONFIG_FILE)
 	config = {
 		"host": SOS_DB_HOST,
 		"port": SOS_DB_PORT,

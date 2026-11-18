@@ -222,6 +222,42 @@ class DependenciasTest(unittest.TestCase):
 		with self.assertRaises(ModuleNotFoundError):
 			gps.gancho_import("sol_device_lib_zz")
 
+	def test_crea_sos_db_con_las_credenciales_del_proyecto(self):
+		directorio = tempfile.mkdtemp()
+		anterior = gps.SOS_DB_FILE
+		gps.SOS_DB_FILE = os.path.join(directorio, "sos_db.txt")
+		try:
+			config = gps.config_chatbot()
+			with open(gps.SOS_DB_FILE, "r") as handle:
+				texto = handle.read()
+		finally:
+			gps.SOS_DB_FILE = anterior
+		self.assertEqual(config["user"], gps.SOS_DB_USER)
+		self.assertEqual(config["password"], gps.SOS_DB_PASSWORD)
+		self.assertEqual(config["host"], gps.SOS_DB_HOST)
+		self.assertEqual(config["database"], "chatbot")
+		self.assertIn("user=" + gps.SOS_DB_USER, texto)
+		self.assertIn("database=sos", texto)
+		anterior_ws = webservice.DB_CONFIG_FILE
+		webservice.DB_CONFIG_FILE = os.path.join(directorio, "ws.txt")
+		try:
+			ws = webservice.db_config()
+		finally:
+			webservice.DB_CONFIG_FILE = anterior_ws
+		self.assertEqual(ws["user"], webservice.SOS_DB_USER)
+		self.assertEqual(ws["database"], "sos")
+
+	def test_no_reemplaza_un_usuario_existente(self):
+		directorio = tempfile.mkdtemp()
+		ruta = os.path.join(directorio, "sos_db.txt")
+		with open(ruta, "w") as handle:
+			handle.write("host=10.0.0.8\nuser=sol\npassword=a=b\n")
+		gps.asegurar_sos_db(ruta)
+		with open(ruta, "r") as handle:
+			texto = handle.read()
+		self.assertIn("user=sol", texto)
+		self.assertIn("password=a=b", texto)
+
 	def test_sin_pymysql_el_aviso_queda_pendiente(self):
 		def importar(nombre, *args, **kwargs):
 			raise ImportError(nombre)
