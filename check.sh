@@ -9,5 +9,5 @@ systemctl status aux3.service
 systemctl status aux4.service
 systemctl status aux5.service
 
-
+echo "SOL V3"
 
