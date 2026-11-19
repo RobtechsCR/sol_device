@@ -276,7 +276,6 @@ import csv
 import datetime
 import json
 import os
-import tempfile
 import threading
 import time
 
@@ -361,9 +360,48 @@ def finish_burst(buffer, first_ts, last_ts, now):
 	return accept_code("".join(buffer), now - first_ts, True, gap)
 
 
+_temporales_limpiados = False
+
+
+def limpiar_temporales(directorio):
+	global _temporales_limpiados
+	if _temporales_limpiados:
+		return
+	_temporales_limpiados = True
+	try:
+		nombres = os.listdir(directorio)
+	except OSError:
+		return
+	limite = time.time() - 60
+	for nombre in nombres:
+		cuerpo = nombre[3:-4]
+		if not (nombre.startswith("tmp") and nombre.endswith(".tmp") and len(cuerpo) == 8 and cuerpo.replace("_", "").isalnum()):
+			continue
+		ruta = os.path.join(directorio, nombre)
+		try:
+			if os.path.isfile(ruta) and os.path.getmtime(ruta) < limite:
+				os.unlink(ruta)
+		except OSError:
+			pass
+
+
 def atomic_write(path, data):
-	os.makedirs(os.path.dirname(path), exist_ok=True)
-	fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+	directorio = os.path.dirname(path) or "."
+	os.makedirs(directorio, exist_ok=True)
+	limpiar_temporales(directorio)
+	try:
+		with open(path, "r") as handle:
+			igual = handle.read() == data
+	except OSError:
+		igual = False
+	if igual:
+		try:
+			os.chmod(path, 0o666)
+		except OSError:
+			pass
+		return
+	tmp = path + ".tmp"
+	fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o666)
 	try:
 		with os.fdopen(fd, "w") as handle:
 			handle.write(data)
@@ -377,6 +415,8 @@ def atomic_write(path, data):
 		except OSError:
 			pass
 		raise
+
+
 
 
 def timestamp():

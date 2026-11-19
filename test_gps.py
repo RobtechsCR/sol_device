@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 
 import pynmea2
@@ -23,6 +24,7 @@ class PosicionGpsTest(unittest.TestCase):
 		gps.KM_FILE = self.km_file
 		gps.ultima_velocidad = 0.0
 		gps.calidadgps = 0
+		gps._temporales_limpiados = False
 		gps.atomic_write(self.gps_file, "Latitud:9.9044991667,Longitud: -84.1270158333,Velocidad: 0.071")
 		gps.atomic_write(self.km_file, "10")
 
@@ -51,6 +53,21 @@ class PosicionGpsTest(unittest.TestCase):
 		linea = sentencia("GPGGA,123519,,,,,0,00,99.9,,,,,,")
 		gps.handle_line(None, linea)
 		self.assertIn("9.9044991667", self.texto())
+
+	def test_no_deja_archivos_temporales(self):
+		viejo = os.path.join(self.directorio.name, "tmpabcd1234.tmp")
+		with open(viejo, "w") as handle:
+			handle.write("viejo")
+		antiguo = time.time() - 120
+		os.utime(viejo, (antiguo, antiguo))
+		gps._temporales_limpiados = False
+		gps.atomic_write(self.gps_file, "Latitud:10,Longitud: -84,Velocidad: 1")
+		gps.atomic_write(self.gps_file, "Latitud:10,Longitud: -84,Velocidad: 1")
+		nombres = os.listdir(self.directorio.name)
+		self.assertFalse(any(nombre.endswith(".tmp") for nombre in nombres))
+		self.assertFalse(os.path.exists(viejo))
+		with open(self.gps_file, "r") as handle:
+			self.assertEqual(handle.read(), "Latitud:10,Longitud: -84,Velocidad: 1")
 
 	def test_un_error_de_kilometraje_no_impide_guardar(self):
 		def falla(*args):
