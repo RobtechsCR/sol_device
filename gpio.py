@@ -316,6 +316,7 @@ def atomic_write(path, data):
 			handle.write(data)
 			handle.flush()
 			os.fsync(handle.fileno())
+		os.chmod(tmp, 0o666)
 		os.replace(tmp, path)
 	except Exception:
 		try:
