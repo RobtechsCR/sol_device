@@ -448,7 +448,7 @@ def getUnidad():
 	return str(result)
 
 
-def read_marked(path, label):
+def read_marked_file(path, label):
 	try:
 		with open(path, "r") as handle:
 			filedata = handle.read()
@@ -457,6 +457,10 @@ def read_marked(path, label):
 		return int(filedata[start:end].strip())
 	except (OSError, ValueError):
 		return 0
+
+
+def read_marked(path, label):
+	return max(read_marked_file(path, label), read_marked_file(path + ".ultimo", label))
 
 
 def get_salidas_pe():
