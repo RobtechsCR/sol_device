@@ -63,6 +63,19 @@ instalar_wiringpi() {
 	python3 generate-bindings.py > bindings.i
 	python3 setup.py install
 	python3 -c "import wiringpi"
+	cd "$ORIGEN"
+}
+
+copiar() {
+	local origen="$1"
+	local destino="$2"
+	mkdir -p "$(dirname "$destino")"
+	if [ -e "$destino" ] && [ "$(readlink -f "$origen")" = "$(readlink -f "$destino")" ]; then
+		echo "Ya esta en su lugar: $destino"
+		return 0
+	fi
+	cp "$origen" "$destino"
+	echo "Copiado: $destino"
 }
 
 asegurar_sos_db() {
@@ -118,17 +131,18 @@ for script in "${SCRIPTS[@]}"; do
 		echo "Falta $ORIGEN/$script"
 		exit 1
 	fi
-	cp "$ORIGEN/$script" "$DESTINO/$script"
+	copiar "$ORIGEN/$script" "$DESTINO/$script"
 done
 
+echo "Instalando servicios."
 for servicio in "${SERVICIOS[@]}"; do
 	unidad="$ORIGEN/${servicio}.service"
 	if [ ! -f "$unidad" ]; then
 		echo "Falta $unidad"
 		exit 1
 	fi
-	cp "$unidad" "/etc/systemd/system/${servicio}.service"
-	cp "$unidad" "$DESTINO/${servicio}.service"
+	copiar "$unidad" "/etc/systemd/system/${servicio}.service"
+	copiar "$unidad" "$DESTINO/${servicio}.service"
 done
 
 asegurar_sos_db
@@ -137,8 +151,19 @@ systemctl daemon-reload
 for servicio in "${SERVICIOS[@]}"; do
 	systemctl enable "${servicio}.service"
 done
+fallos=0
 for servicio in gps gpio sql webservice nfc aux1 aux2 aux3 aux4 aux5 updater; do
-	systemctl restart "${servicio}.service"
+	if systemctl restart "${servicio}.service"; then
+		echo "Servicio activo: ${servicio}.service"
+	else
+		echo "No arranco ${servicio}.service"
+		fallos=1
+	fi
 done
+
+if [ "$fallos" -ne 0 ]; then
+	echo "Los servicios quedaron instalados, pero alguno no arranco."
+	exit 1
+fi
 
 echo "Instalacion completa. Scripts y servicios quedaron en $DESTINO."
