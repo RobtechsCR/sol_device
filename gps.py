@@ -439,82 +439,66 @@ def update_quality(line):
 		print(error)
 
 
-def handle_rmc(line):
-	resp = pynmea2.parse(line)
-	latitud = resp.latitude
-	longitud = resp.longitude
-	velocidad_n = resp.spd_over_grnd
-	velocidad = float(velocidad_n) * 1.852 if velocidad_n else 0.0
+ultima_velocidad = 0.0
+
+
+def velocidad_de(msg):
+	global ultima_velocidad
+	kmh = getattr(msg, "spd_over_grnd_kmph", None)
+	if kmh not in (None, ""):
+		try:
+			ultima_velocidad = float(kmh)
+			return ultima_velocidad
+		except (TypeError, ValueError):
+			pass
+	nudos = getattr(msg, "spd_over_grnd", None)
+	if nudos not in (None, ""):
+		try:
+			ultima_velocidad = float(nudos) * 1.852
+			return ultima_velocidad
+		except (TypeError, ValueError):
+			pass
+	return ultima_velocidad
+
+
+def guardar_posicion(latitud, longitud, velocidad):
+	try:
+		latitud = float(latitud)
+		longitud = float(longitud)
+	except (TypeError, ValueError):
+		return
+	if latitud == 0.0 and longitud == 0.0:
+		return
 	print(str(latitud) + ", " + str(longitud))
 	print(velocidad)
-	km_acumulado = actualizar_km(latitud, longitud, velocidad)
-	print(km_acumulado)
-	write_position(latitud, longitud, velocidad, km_acumulado, 0)
-
-
-def collect_gngll(gps, first_line):
-	line = first_line
-	previous_timeout = gps.timeout
-	gps.timeout = 0.2
-	started = time.monotonic()
 	try:
-		while "$GNVTG" not in line:
-			if time.monotonic() - started > 2.0:
-				print("GNGLL sin VTG, se re-sincroniza")
-				return None
-			raw = gps.readline()
-			if not raw:
-				continue
-			line = line + raw.decode("ascii", errors="replace").strip()
-		return line
-	finally:
-		gps.timeout = previous_timeout
-
-
-def handle_gngll(gps, line):
-	line = collect_gngll(gps, line)
-	if not line:
-		return
-	print("Getting coordinates")
-	print(line)
-	index1 = line.index("$GNGLL") + 7
-	index2 = line.index(",", index1)
-	index3 = line.index(",", index2 + 1)
-	index4 = line.index(",", index3 + 1)
-	index5 = line.index(",", index4 + 1)
-	latitud = line[index1:index2]
-	latitud_t = line[index2 + 1:index3]
-	longitud = line[index3 + 1:index4]
-	longitud_t = line[index4 + 1:index5]
-	latitud_dms = get_coordenadas_dms(latitud + latitud_t, 1)
-	longitud_dms = get_coordenadas_dms(longitud + longitud_t, 2)
-	if not latitud_dms or not longitud_dms:
-		print("Datos gps invalidos")
-		return
-	latitud_decimal = dms_a_decimal(latitud_dms[0], latitud_dms[1], latitud_dms[2], latitud_dms[3])
-	longitud_decimal = dms_a_decimal(longitud_dms[0], longitud_dms[1], longitud_dms[2], longitud_dms[3])
-	index_vtg = line.index("$GNVTG")
-	index_n = line.index("N", index_vtg + 6)
-	index_end = line.index(",", index_n + 2)
-	velocidad = line[index_n + 2:index_end]
-	km_acumulado = actualizar_km(latitud_decimal, longitud_decimal, velocidad)
-	print("KM ACUMU", km_acumulado)
-	write_position(latitud_decimal, longitud_decimal, velocidad, km_acumulado, 4)
+		km_acumulado = actualizar_km(latitud, longitud, velocidad)
+	except Exception as error:
+		print(error)
+		km_acumulado = get_km()
+	print(km_acumulado)
+	try:
+		write_position(latitud, longitud, velocidad, km_acumulado, 0)
+	except OSError as error:
+		print("No se pudo escribir gps.txt", error)
 
 
 def handle_line(gps, line):
-	global calidadgps
 	print(line)
-	update_quality(line)
-	if calidadgps > 2:
-		print("GPS Poco Preciso")
-	if calidadgps > 2:
+	if "GGA" in line:
+		update_quality(line)
+		if calidadgps > 2:
+			print("GPS Poco Preciso")
+	try:
+		msg = pynmea2.parse(line)
+	except (pynmea2.ParseError, ValueError, TypeError) as error:
+		print(error)
 		return
-	if line.startswith("$GPRMC"):
-		print("Getting coordinates")
-		handle_rmc(line)
-	elif line.startswith("$GNGLL"):
-		handle_gngll(gps, line)
+	latitud = getattr(msg, "latitude", None)
+	longitud = getattr(msg, "longitude", None)
+	if latitud is None or longitud is None:
+		return
+	guardar_posicion(latitud, longitud, velocidad_de(msg))
 
 
 def run_session():
