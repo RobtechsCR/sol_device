@@ -4,6 +4,9 @@
 #
 # Uso:
 #   sudo bash actualizacion.sh
+#
+# La primera ejecucion deja actualizacion.service activo. Despues revisa el
+# repositorio cada 5 minutos y aplica los cambios sola.
 
 set -u
 
@@ -33,6 +36,8 @@ ARCHIVOS=(
 	aux3.service
 	aux4.service
 	aux5.service
+	actualizacion.sh
+	actualizacion.service
 	check.sh
 	install.sh
 	services.sh
@@ -77,7 +82,6 @@ for archivo in "${ARCHIVOS[@]}"; do
 	destino="$DESTINO/$archivo"
 	if [ -f "$destino" ] && cmp -s "$temporal" "$destino"; then
 		rm -f "$temporal"
-		echo "Sin cambios: $archivo"
 		continue
 	fi
 	mv "$temporal" "$destino"
@@ -88,13 +92,17 @@ for archivo in "${ARCHIVOS[@]}"; do
 	cambiados+=("$archivo")
 done
 
-for servicio in gps gpio sql webservice updater nfc aux1 aux2 aux3 aux4 aux5; do
+for servicio in gps gpio sql webservice updater nfc aux1 aux2 aux3 aux4 aux5 actualizacion; do
 	unidad="$DESTINO/${servicio}.service"
 	if [ -f "$unidad" ]; then
 		cp "$unidad" "/etc/systemd/system/${servicio}.service"
 	fi
 done
 systemctl daemon-reload
+if ! systemctl enable actualizacion.service; then
+	echo "No se pudo habilitar actualizacion.service"
+	fallos=1
+fi
 
 for servicio in "${SERVICIOS[@]}"; do
 	if [ "$servicio" = "updater" ]; then
@@ -128,9 +136,35 @@ if [ "${#cambiados[@]}" -gt 0 ]; then
 	done
 fi
 
+unidad_cambio=0
+if [ "${#cambiados[@]}" -gt 0 ]; then
+	for archivo in "${cambiados[@]}"; do
+		if [ "$archivo" = "actualizacion.service" ]; then
+			unidad_cambio=1
+		fi
+	done
+fi
+if systemctl is-active --quiet actualizacion.service; then
+	if [ "$unidad_cambio" -eq 1 ]; then
+		echo "Reiniciando actualizacion.service"
+		systemctl restart actualizacion.service
+	fi
+else
+	if systemctl start actualizacion.service; then
+		echo "actualizacion.service quedo activo y revisa el repositorio cada 5 minutos."
+	else
+		echo "No arranco actualizacion.service"
+		fallos=1
+	fi
+fi
+
 if [ "$fallos" -ne 0 ]; then
 	echo "La actualizacion termino con errores."
 	exit 1
 fi
 
-echo "Actualizacion completa."
+if [ "${#cambiados[@]}" -eq 0 ]; then
+	echo "Sin actualizaciones."
+else
+	echo "Actualizacion completa."
+fi
