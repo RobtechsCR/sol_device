@@ -21,3 +21,5 @@ sudo cp /home/orangepi/Documents/aux5.service /etc/systemd/system/
 sudo systemctl enable aux5.service
 sudo cp /home/orangepi/Documents/nfc.service /etc/systemd/system/
 sudo systemctl enable nfc.service
+sudo cp /home/orangepi/Documents/actualizacion.service /etc/systemd/system/
+sudo systemctl enable actualizacion.service

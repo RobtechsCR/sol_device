@@ -17,6 +17,7 @@ SCRIPTS=(
 	aux3.py
 	aux4.py
 	aux5.py
+	actualizacion.sh
 )
 SERVICIOS=(
 	gps
@@ -30,6 +31,7 @@ SERVICIOS=(
 	aux3
 	aux4
 	aux5
+	actualizacion
 )
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -132,6 +134,9 @@ for script in "${SCRIPTS[@]}"; do
 		exit 1
 	fi
 	copiar "$ORIGEN/$script" "$DESTINO/$script"
+	if [[ "$script" == *.sh ]]; then
+		chmod 755 "$DESTINO/$script"
+	fi
 done
 
 echo "Instalando servicios."
@@ -152,7 +157,7 @@ for servicio in "${SERVICIOS[@]}"; do
 	systemctl enable "${servicio}.service"
 done
 fallos=0
-for servicio in gps gpio sql webservice nfc aux1 aux2 aux3 aux4 aux5 updater; do
+for servicio in gps gpio sql webservice nfc aux1 aux2 aux3 aux4 aux5 updater actualizacion; do
 	if systemctl restart "${servicio}.service"; then
 		echo "Servicio activo: ${servicio}.service"
 	else

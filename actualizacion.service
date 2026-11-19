@@ -1,0 +1,15 @@
+[Unit]
+Description=Actualizacion de scripts desde el repositorio
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+ExecStart=/bin/bash -c 'while true; do /bin/bash /home/orangepi/Documents/actualizacion.sh; sleep 300; done'
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
