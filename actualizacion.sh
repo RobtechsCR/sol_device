@@ -41,6 +41,7 @@ ARCHIVOS=(
 	check.sh
 	install.sh
 	services.sh
+	monitor.sh
 )
 SERVICIOS=(
 	gps
