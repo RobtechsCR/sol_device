@@ -87,6 +87,7 @@ mostrar_servicio() {
 	if [ "$servicio" = "gps" ]; then
 		texto="$(printf '%s\n' "$texto" | grep -vE '^\$[A-Z]{4,},' || true)"
 	fi
+	texto="$(printf '%s\n' "$texto" | grep -vE "Unknown key name '|ignoring\.$|pam_unix\\(sudo:session\\)" || true)"
 	texto="$(printf '%s\n' "$texto" | sed '/^[[:space:]]*$/d' | tail -n "$LINEAS")"
 	if [ -z "$texto" ]; then
 		echo "  sin mensajes"
