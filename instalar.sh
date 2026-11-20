@@ -18,6 +18,7 @@ SCRIPTS=(
 	aux4.py
 	aux5.py
 	actualizacion.sh
+	monitor.sh
 )
 SERVICIOS=(
 	gps
@@ -113,7 +114,7 @@ EOF
 
 echo "Actualizando paquetes."
 apt-get update
-apt-get install -y git swig python3-dev python3-setuptools python3-pip python3-evdev sqlite3
+apt-get install -y git swig python3-dev python3-setuptools python3-pip python3-evdev sqlite3 lm-sensors
 
 instalar_wiringpi
 

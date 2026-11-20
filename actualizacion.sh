@@ -41,6 +41,7 @@ ARCHIVOS=(
 	check.sh
 	install.sh
 	services.sh
+	monitor.sh
 )
 SERVICIOS=(
 	gps
@@ -65,9 +66,25 @@ mkdir -p "$DESTINO"
 fallos=0
 cambiados=()
 
+descargar() {
+	local url="$1"
+	local destino="$2"
+	local intento
+	for intento in 1 2 3; do
+		if curl -fsSL --connect-timeout 20 --max-time 90 -o "$destino" "$url"; then
+			return 0
+		fi
+		if curl -4 --noproxy '*' -fsSL --connect-timeout 20 --max-time 90 -o "$destino" "$url"; then
+			return 0
+		fi
+		sleep 2
+	done
+	return 1
+}
+
 for archivo in "${ARCHIVOS[@]}"; do
 	temporal="$(mktemp)"
-	if ! curl -fsSL -o "$temporal" "$REPO/$archivo"; then
+	if ! descargar "$REPO/$archivo" "$temporal"; then
 		echo "No se pudo descargar $archivo"
 		rm -f "$temporal"
 		fallos=1
