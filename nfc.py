@@ -529,6 +529,28 @@ def parse_asistencia_row(row):
 	}
 
 
+_aviso_asistencia = {"texto": "", "cuando": 0.0}
+_pausa_asistencia_hasta = 0.0
+
+
+def procedimiento_ausente(error):
+	args = getattr(error, "args", ())
+	if args and args[0] == 1305:
+		return True
+	texto = str(error)
+	return "PROCEDURE" in texto and "does not exist" in texto
+
+
+def avisar_fallo_asistencia(error):
+	global _aviso_asistencia
+	texto = str(error)
+	ahora = time.time()
+	if texto == _aviso_asistencia["texto"] and ahora - _aviso_asistencia["cuando"] < 300:
+		return
+	_aviso_asistencia = {"texto": texto, "cuando": ahora}
+	print("No se pudo registrar asistencia", error)
+
+
 def is_tarjeta_rechazada(error):
 	if getattr(error, "sqlstate", None) == "45000":
 		return True
@@ -701,6 +723,9 @@ def resultado_base(item):
 
 
 def process_queue_once():
+	global _pausa_asistencia_hasta
+	if time.time() < _pausa_asistencia_hasta:
+		return False
 	with queue_lock:
 		items = load_queue()
 	if not items:
@@ -715,7 +740,9 @@ def process_queue_once():
 		row = call_registrar(item)
 	except Exception as error:
 		if not is_tarjeta_rechazada(error):
-			print("No se pudo registrar asistencia", error)
+			avisar_fallo_asistencia(error)
+			if procedimiento_ausente(error):
+				_pausa_asistencia_hasta = time.time() + 300
 			return False
 		result = resultado_base(item)
 		result.update({

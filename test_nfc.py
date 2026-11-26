@@ -92,6 +92,8 @@ class AsistenciaTest(unittest.TestCase):
 		self.avisos = []
 		self.original["avisar_gpio"] = nfc.avisar_gpio
 		nfc.avisar_gpio = self.avisos.append
+		nfc._aviso_asistencia = {"texto": "", "cuando": 0.0}
+		nfc._pausa_asistencia_hasta = 0.0
 
 	def tearDown(self):
 		for key, value in self.original.items():
@@ -170,6 +172,20 @@ class AsistenciaTest(unittest.TestCase):
 		self.assertEqual(saved["estado"], "rechazada")
 		self.assertEqual(self.avisos, ["rechazada"])
 		self.assertEqual(saved["mensaje"], "Tarjeta no autorizada")
+
+	def test_procedimiento_ausente_no_repite_la_consulta(self):
+		llamadas = []
+
+		def ausente(item):
+			llamadas.append(item["codigo"])
+			raise type("Ausente", (Exception,), {})(1305, "PROCEDURE sos.proc_registrar_asistencia_entrada does not exist")
+
+		nfc.call_registrar = ausente
+		nfc.save_queue([nfc.nueva_lectura("a36f48n9", "15", 9.9, -84.0, "2026-09-28 10:00:03")])
+		self.assertFalse(nfc.process_queue_once())
+		self.assertFalse(nfc.process_queue_once())
+		self.assertEqual(llamadas, ["a36f48n9"])
+		self.assertEqual(nfc.load_queue()[0]["codigo"], "a36f48n9")
 
 	def test_sin_conexion_conserva_la_cola(self):
 		def sin_red(item):
