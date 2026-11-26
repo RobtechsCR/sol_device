@@ -374,35 +374,120 @@ def en_predio():
 		return False
 
 
-def leer_contadores(path, campos):
+def ruta_ultimo(path):
+	return path + ".ultimo"
+
+
+def leer_texto(path):
 	try:
 		with open(path, "r") as handle:
-			filedata = handle.read()
+			return handle.read()
 	except OSError:
-		filedata = ""
+		return None
+
+
+def valores_marcados(texto, campos):
 	valores = {}
 	for campo in campos:
 		label = campo + ": "
+		pos = texto.find(label) if texto else -1
+		if pos < 0:
+			valores[campo] = None
+			continue
+		fin = texto.find("$$", pos + len(label))
+		if fin < 0:
+			valores[campo] = None
+			continue
 		try:
-			start = filedata.index(label) + len(label)
-			end = filedata.index("$$", start)
-			valores[campo] = int(filedata[start:end].strip())
-		except (ValueError, IndexError):
-			valores[campo] = 0
+			valores[campo] = int(texto[pos + len(label):fin].strip())
+		except ValueError:
+			valores[campo] = None
 	return valores
 
 
+def bases_leidas(valores, campos):
+	for campo in campos:
+		if campo.endswith("_Predio"):
+			continue
+		if valores.get(campo) is None:
+			return False
+	return True
+
+
+def texto_contadores(campos, valores):
+	return "".join(campo + ": " + str(int(valores[campo])) + "$$" for campo in campos)
+
+
 def escribir_contadores(path, campos, valores):
-	body = "".join(campo + ": " + str(int(valores[campo])) + "$$" for campo in campos)
-	atomic_write(path, body)
+	atomic_write(path, texto_contadores(campos, valores))
+
+
+def combinar_maximo(fuentes, campos):
+	salida = {}
+	for campo in campos:
+		mayor = None
+		for valores in fuentes:
+			if not valores or valores.get(campo) is None:
+				continue
+			valor = int(valores[campo])
+			if mayor is None or valor > mayor:
+				mayor = valor
+		salida[campo] = 0 if mayor is None else mayor
+	return salida
+
+
+def leer_contadores(path, campos):
+	texto = leer_texto(path)
+	valores = valores_marcados(texto, campos)
+	ultimo = leer_texto(ruta_ultimo(path))
+	valores_ultimo = valores_marcados(ultimo, campos)
+	fuentes = []
+	if texto is not None and bases_leidas(valores, campos):
+		fuentes.append(valores)
+	if ultimo is not None and bases_leidas(valores_ultimo, campos):
+		fuentes.append(valores_ultimo)
+	if not fuentes:
+		if texto is None and ultimo is None:
+			return None
+		print("No se reescriben los contadores de " + path)
+		return None
+	buenos = combinar_maximo(fuentes, campos)
+	if texto != texto_contadores(campos, buenos):
+		bajo = False
+		if texto is not None and bases_leidas(valores, campos):
+			for campo in campos:
+				if valores.get(campo) is not None and int(valores[campo]) < buenos[campo]:
+					bajo = True
+		if bajo:
+			print("Contador conservado, no se permite reiniciar " + path)
+		elif not bases_leidas(valores, campos):
+			print("Contadores restaurados desde " + ruta_ultimo(path))
+		escribir_contadores(path, campos, buenos)
+	return buenos
 
 
 def incrementar_contador(path, campos, normal, predio):
 	with contador_lock:
 		valores = leer_contadores(path, campos)
+		if valores is None:
+			if leer_texto(path) is None and leer_texto(ruta_ultimo(path)) is None:
+				valores = {campo: 0 for campo in campos}
+			else:
+				return
 		campo = predio if en_predio() else normal
 		valores[campo] = int(valores.get(campo, 0)) + 1
+		escribir_contadores(ruta_ultimo(path), campos, valores)
 		escribir_contadores(path, campos, valores)
+
+
+def proteger_contadores():
+	for path, campos in ((ENTRADAS_PE, CAMPOS_PE), (ENTRADAS_PS, CAMPOS_PS)):
+		with contador_lock:
+			valores = leer_contadores(path, campos)
+			if valores is None:
+				continue
+			escribir_contadores(ruta_ultimo(path), campos, valores)
+			escribir_contadores(path, campos, valores)
 
 
 def getval_se():
@@ -648,6 +733,7 @@ def incremeta_salidas_ps():
 
 
 def iniciar():
+	proteger_contadores()
 	global wiringpi
 	import wiringpi as modulo
 	from wiringpi import GPIO
