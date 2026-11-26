@@ -321,7 +321,6 @@ CALL_SQL = "CALL proc_registrar_asistencia_entrada(%s, %s, %s, %s, %s)"
 queue_lock = threading.Lock()
 worker_started = False
 SPECIFIC_HINTS = ("rfid", "nfc", "mifare", "barcode", "reader", "card", "sycreader", "proximity")
-GENERIC_HINTS = ("hid",)
 
 
 def accept_code(text, elapsed, ended_with_enter, gap_exceeded=False):
@@ -530,7 +529,13 @@ def parse_asistencia_row(row):
 
 
 _aviso_asistencia = {"texto": "", "cuando": 0.0}
-_pausa_asistencia_hasta = 0.0
+_aviso_sin_lector = 0.0
+_aviso_sin_bus = {"clave": "", "cuando": 0.0}
+_aviso_cola_ajena = False
+_aviso_cola_ilegible = False
+_bloqueo_procedimiento = False
+_reintento_hasta = 0.0
+_reintento_espera = 30.0
 
 
 def procedimiento_ausente(error):
@@ -567,13 +572,64 @@ def error_mensaje(error):
 	return str(error)
 
 
+def avisar_sin_lector():
+	global _aviso_sin_lector
+	ahora = time.time()
+	if ahora - _aviso_sin_lector < 300:
+		return
+	_aviso_sin_lector = ahora
+	print("Lector NFC no encontrado")
+
+
+def avisar_sin_bus(item):
+	global _aviso_sin_bus
+	clave = str(item.get("codigo", "")) + "|" + str(item.get("fecha", ""))
+	ahora = time.time()
+	if clave == _aviso_sin_bus["clave"] and ahora - _aviso_sin_bus["cuando"] < 300:
+		return
+	_aviso_sin_bus = {"clave": clave, "cuando": ahora}
+	print("Asistencia en espera, falta el numero de bus")
+
+
+def envio_en_pausa():
+	if _bloqueo_procedimiento:
+		return True
+	return time.time() < _reintento_hasta
+
+
+def pausar_por_red():
+	global _reintento_hasta, _reintento_espera
+	_reintento_hasta = time.time() + _reintento_espera
+	_reintento_espera = min(_reintento_espera * 2, 300.0)
+
+
+def bloquear_por_procedimiento():
+	global _bloqueo_procedimiento
+	_bloqueo_procedimiento = True
+
+
+def reanudar_envio():
+	global _bloqueo_procedimiento, _reintento_hasta, _reintento_espera
+	_bloqueo_procedimiento = False
+	_reintento_hasta = 0.0
+	_reintento_espera = 30.0
+
+
+def lectura_enviable(item):
+	if not isinstance(item, dict) or item.get("origen") != "lector":
+		return False
+	return accept_code(item.get("codigo"), 0, True) is not None
+
+
 def load_queue():
+	global _aviso_cola_ilegible
 	try:
 		with open(QUEUE_FILE, "r") as handle:
 			lines = handle.read().splitlines()
 	except OSError:
 		return []
 	items = []
+	ilegibles = 0
 	for line in lines:
 		line = line.strip()
 		if not line:
@@ -581,10 +637,17 @@ def load_queue():
 		try:
 			item = json.loads(line)
 		except ValueError:
-			print("Lectura pendiente ilegible")
+			ilegibles += 1
 			continue
 		if isinstance(item, dict) and item.get("codigo"):
 			items.append(item)
+		else:
+			ilegibles += 1
+	if ilegibles:
+		save_queue(items)
+		if not _aviso_cola_ilegible:
+			_aviso_cola_ilegible = True
+			print("Se omitio una lectura pendiente ilegible")
 	return items
 
 
@@ -594,8 +657,13 @@ def save_queue(items):
 
 
 def enqueue_asistencia(codigo):
+	codigo = accept_code(codigo, 0, True)
+	if not codigo:
+		return None
+	reanudar_envio()
 	lat, lng = read_position()
 	item = nueva_lectura(codigo, read_bus_numero(), lat, lng, timestamp())
+	item["origen"] = "lector"
 	with queue_lock:
 		items = load_queue()
 		items.append(item)
@@ -722,19 +790,30 @@ def resultado_base(item):
 	}
 
 
+def omitir_lectura_ajena(item):
+	global _aviso_cola_ajena
+	drop_item(item)
+	if _aviso_cola_ajena:
+		return
+	_aviso_cola_ajena = True
+	print("No se envia asistencia sin una lectura del lector")
+
+
 def process_queue_once():
-	global _pausa_asistencia_hasta
-	if time.time() < _pausa_asistencia_hasta:
+	if envio_en_pausa():
 		return False
 	with queue_lock:
 		items = load_queue()
 	if not items:
 		return False
 	item = dict(items[0])
+	if not lectura_enviable(item):
+		omitir_lectura_ajena(item)
+		return True
 	if not item.get("bus"):
 		item["bus"] = read_bus_numero()
 	if not item.get("bus"):
-		print("Asistencia en espera, falta el numero de bus")
+		avisar_sin_bus(item)
 		return False
 	try:
 		row = call_registrar(item)
@@ -742,8 +821,11 @@ def process_queue_once():
 		if not is_tarjeta_rechazada(error):
 			avisar_fallo_asistencia(error)
 			if procedimiento_ausente(error):
-				_pausa_asistencia_hasta = time.time() + 300
+				bloquear_por_procedimiento()
+			else:
+				pausar_por_red()
 			return False
+		reanudar_envio()
 		result = resultado_base(item)
 		result.update({
 			"estado": "rechazada",
@@ -758,6 +840,7 @@ def process_queue_once():
 		drop_item(item)
 		avisar_gpio(result["estado"])
 		return True
+	reanudar_envio()
 	parsed = parse_asistencia_row(row)
 	if not parsed:
 		result = resultado_base(item)
@@ -780,6 +863,7 @@ def process_queue_once():
 	record_result(result)
 	drop_item(item)
 	avisar_gpio(result["estado"])
+	reanudar_envio()
 	return True
 
 
@@ -828,18 +912,6 @@ def configured_device():
 	return hint or None
 
 
-def usb_keyboard_paths():
-	base = "/dev/input/by-id"
-	found = []
-	if not os.path.isdir(base):
-		return found
-	for name in os.listdir(base):
-		lower = name.lower()
-		if "usb" in lower and ("kbd" in lower or "keyboard" in lower):
-			found.append(os.path.realpath(os.path.join(base, name)))
-	return found
-
-
 def is_keyboard(device, ecodes):
 	keys = device.capabilities().get(ecodes.EV_KEY, [])
 	has_enter = ecodes.KEY_ENTER in keys or ecodes.KEY_KPENTER in keys
@@ -865,26 +937,18 @@ def match_hint(hint, devices, evdev_module):
 
 
 def match_reader(devices, ecodes):
-	keyboards = [device for device in devices if is_keyboard(device, ecodes)]
 	specific = []
-	generic = []
-	for device in keyboards:
+	for device in devices:
+		if not is_keyboard(device, ecodes):
+			continue
 		name = (device.name or "").lower()
 		if any(hint in name for hint in SPECIFIC_HINTS):
 			specific.append(device)
-		elif any(hint in name for hint in GENERIC_HINTS):
-			generic.append(device)
-	if specific:
-		if len(specific) > 1:
-			print("Varios lectores, se usa " + specific[0].path + " " + specific[0].name)
-		return specific[0]
-	if len(generic) == 1:
-		return generic[0]
-	usb_paths = set(usb_keyboard_paths())
-	usb = [device for device in keyboards if os.path.realpath(device.path) in usb_paths]
-	if len(usb) == 1:
-		return usb[0]
-	return None
+	if not specific:
+		return None
+	if len(specific) > 1:
+		print("Varios lectores, se usa " + specific[0].path + " " + specific[0].name)
+	return specific[0]
 
 
 def close_unused(devices, selected):
@@ -1025,7 +1089,7 @@ def main():
 		try:
 			device = find_device(evdev)
 			if device is None:
-				print("Lector NFC no encontrado")
+				avisar_sin_lector()
 				time.sleep(2)
 				continue
 			print("Lector NFC " + device.path + " " + device.name)

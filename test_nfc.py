@@ -69,6 +69,29 @@ class DuplicateTest(unittest.TestCase):
 EJEMPLO = '"att_0fb53bd2bb8111f1","hrs_ba6591673c93","0","Asistencia registrada: Esteban Robles","cmp_3b827a32c35b","2026-09-28"'
 
 
+def en_cola(codigo="a36f48n9", bus="15", fecha="2026-09-28 10:00:00", lat=9.93, lng=-84.08):
+	item = nfc.nueva_lectura(codigo, bus, lat, lng, fecha)
+	item["origen"] = "lector"
+	return item
+
+
+class Codigos:
+	EV_KEY = 1
+	KEY_ENTER = 28
+	KEY_KPENTER = 96
+	KEY_A = 30
+	KEY_1 = 2
+
+
+class Dispositivo:
+	def __init__(self, path, name):
+		self.path = path
+		self.name = name
+
+	def capabilities(self):
+		return {Codigos.EV_KEY: [Codigos.KEY_ENTER, Codigos.KEY_A, Codigos.KEY_1]}
+
+
 class AsistenciaTest(unittest.TestCase):
 	def setUp(self):
 		self.directory = tempfile.mkdtemp()
@@ -93,7 +116,13 @@ class AsistenciaTest(unittest.TestCase):
 		self.original["avisar_gpio"] = nfc.avisar_gpio
 		nfc.avisar_gpio = self.avisos.append
 		nfc._aviso_asistencia = {"texto": "", "cuando": 0.0}
-		nfc._pausa_asistencia_hasta = 0.0
+		nfc._aviso_sin_lector = 0.0
+		nfc._aviso_sin_bus = {"clave": "", "cuando": 0.0}
+		nfc._aviso_cola_ajena = False
+		nfc._aviso_cola_ilegible = False
+		nfc._bloqueo_procedimiento = False
+		nfc._reintento_hasta = 0.0
+		nfc._reintento_espera = 30.0
 
 	def tearDown(self):
 		for key, value in self.original.items():
@@ -148,7 +177,7 @@ class AsistenciaTest(unittest.TestCase):
 			"cmp_3b827a32c35b",
 			"2026-09-28",
 		)
-		nfc.save_queue([nfc.nueva_lectura("a36f48n9", "15", 9.93, -84.08, "2026-09-28 10:00:00")])
+		nfc.save_queue([en_cola()])
 		self.assertTrue(nfc.process_queue_once())
 		self.assertEqual(nfc.load_queue(), [])
 		with open(nfc.RESULT_FILE, "r") as handle:
@@ -164,7 +193,7 @@ class AsistenciaTest(unittest.TestCase):
 			raise type("Rechazo", (Exception,), {})(1644, "Tarjeta no autorizada")
 
 		nfc.call_registrar = rechazar
-		nfc.save_queue([nfc.nueva_lectura("a36f48n9", "15", 9.9, -84.0, "2026-09-28 10:00:01")])
+		nfc.save_queue([en_cola(fecha="2026-09-28 10:00:01", lat=9.9, lng=-84.0)])
 		self.assertTrue(nfc.process_queue_once())
 		self.assertEqual(nfc.load_queue(), [])
 		with open(nfc.RESULT_FILE, "r") as handle:
@@ -181,7 +210,7 @@ class AsistenciaTest(unittest.TestCase):
 			raise type("Ausente", (Exception,), {})(1305, "PROCEDURE sos.proc_registrar_asistencia_entrada does not exist")
 
 		nfc.call_registrar = ausente
-		nfc.save_queue([nfc.nueva_lectura("a36f48n9", "15", 9.9, -84.0, "2026-09-28 10:00:03")])
+		nfc.save_queue([en_cola(fecha="2026-09-28 10:00:03", lat=9.9, lng=-84.0)])
 		self.assertFalse(nfc.process_queue_once())
 		self.assertFalse(nfc.process_queue_once())
 		self.assertEqual(llamadas, ["a36f48n9"])
@@ -192,8 +221,7 @@ class AsistenciaTest(unittest.TestCase):
 			raise type("Conexion", (Exception,), {})(2003, "Can't connect to MySQL server")
 
 		nfc.call_registrar = sin_red
-		item = nfc.nueva_lectura("a36f48n9", "15", 9.9, -84.0, "2026-09-28 10:00:02")
-		nfc.save_queue([item])
+		nfc.save_queue([en_cola(fecha="2026-09-28 10:00:02", lat=9.9, lng=-84.0)])
 		self.assertFalse(nfc.process_queue_once())
 		self.assertEqual(self.avisos, [])
 		self.assertEqual(nfc.load_queue()[0]["codigo"], "a36f48n9")
@@ -224,9 +252,68 @@ class AsistenciaTest(unittest.TestCase):
 		self.assertEqual(nfc.secuencia_para_estado("sin_datos"), ())
 
 	def test_espera_si_falta_el_numero_de_bus(self):
-		nfc.save_queue([nfc.nueva_lectura("a36f48n9", "", 0, 0, "2026-09-28 10:00:03")])
+		nfc.save_queue([en_cola(bus="", fecha="2026-09-28 10:00:03", lat=0, lng=0)])
 		self.assertFalse(nfc.process_queue_once())
 		self.assertEqual(len(nfc.load_queue()), 1)
+
+	def test_cola_vieja_no_consulta_la_base(self):
+		llamadas = []
+		nfc.call_registrar = lambda item: llamadas.append(item["codigo"])
+		nfc.save_queue([nfc.nueva_lectura("a36f48n9", "15", 9.9, -84.0, "2026-09-28 10:00:04")])
+		nfc.process_pending()
+		self.assertEqual(llamadas, [])
+		self.assertEqual(nfc.load_queue(), [])
+
+	def test_sin_red_no_repite_la_consulta_en_seguida(self):
+		llamadas = []
+
+		def sin_red(item):
+			llamadas.append(item["codigo"])
+			raise type("Conexion", (Exception,), {})(2003, "Can't connect to MySQL server")
+
+		nfc.call_registrar = sin_red
+		nfc.save_queue([en_cola(fecha="2026-09-28 10:00:05", lat=9.9, lng=-84.0)])
+		self.assertFalse(nfc.process_queue_once())
+		self.assertFalse(nfc.process_queue_once())
+		self.assertEqual(llamadas, ["a36f48n9"])
+		self.assertEqual(nfc.load_queue()[0]["codigo"], "a36f48n9")
+
+	def test_otra_lectura_permite_un_nuevo_intento(self):
+		llamadas = []
+
+		def ausente(item):
+			llamadas.append(item["codigo"])
+			raise type("Ausente", (Exception,), {})(1305, "PROCEDURE sos.proc_registrar_asistencia_entrada does not exist")
+
+		nfc.call_registrar = ausente
+		nfc.save_queue([en_cola(fecha="2026-09-28 10:00:06", lat=9.9, lng=-84.0)])
+		self.assertFalse(nfc.process_queue_once())
+		with open(nfc.BUS_FILE, "w") as handle:
+			handle.write("15")
+		marca = nfc.timestamp
+		nfc.timestamp = lambda: "2026-09-28 10:00:07"
+		try:
+			self.assertIsNotNone(nfc.enqueue_asistencia("b36f48n9"))
+		finally:
+			nfc.timestamp = marca
+		self.assertFalse(nfc.process_queue_once())
+		self.assertEqual(llamadas, ["a36f48n9", "a36f48n9"])
+		self.assertEqual([item["codigo"] for item in nfc.load_queue()], ["a36f48n9", "b36f48n9"])
+
+	def test_un_codigo_corto_no_reanuda_el_envio(self):
+		nfc._bloqueo_procedimiento = True
+		self.assertIsNone(nfc.enqueue_asistencia("abc"))
+		self.assertTrue(nfc._bloqueo_procedimiento)
+
+
+class LectorTest(unittest.TestCase):
+	def test_un_teclado_no_es_lector(self):
+		teclado = Dispositivo("/dev/input/event0", "USB Keyboard")
+		self.assertIsNone(nfc.match_reader([teclado], Codigos))
+
+	def test_un_lector_rfid_si_se_usa(self):
+		lector = Dispositivo("/dev/input/event1", "Sycreader RFID Reader")
+		self.assertIs(nfc.match_reader([lector], Codigos), lector)
 
 
 if __name__ == "__main__":
