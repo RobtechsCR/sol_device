@@ -81,6 +81,7 @@ class AsistenciaTest(unittest.TestCase):
 			"GPS_FILE": nfc.GPS_FILE,
 			"DB_CONFIG_FILE": nfc.DB_CONFIG_FILE,
 			"call_registrar": nfc.call_registrar,
+			"consultar_unidad": nfc.consultar_unidad,
 		}
 		nfc.QUEUE_FILE = os.path.join(self.directory, "cola.txt")
 		nfc.RESULT_FILE = os.path.join(self.directory, "asistencia.txt")
@@ -92,6 +93,7 @@ class AsistenciaTest(unittest.TestCase):
 		self.avisos = []
 		self.original["avisar_gpio"] = nfc.avisar_gpio
 		nfc.avisar_gpio = self.avisos.append
+		nfc.consultar_unidad = lambda: ""
 
 	def tearDown(self):
 		for key, value in self.original.items():
@@ -206,6 +208,25 @@ class AsistenciaTest(unittest.TestCase):
 
 	def test_sin_red_no_tiene_secuencia(self):
 		self.assertEqual(nfc.secuencia_para_estado("sin_datos"), ())
+
+	def test_ignora_unidad_vacia_y_consulta_el_servidor(self):
+		with open(nfc.UNIDAD_FILE, "w") as handle:
+			handle.write("None")
+		self.assertEqual(nfc.read_bus_numero(), "")
+		nfc.consultar_unidad = lambda: "15"
+		nfc.call_registrar = lambda item: (
+			"att_0fb53bd2bb8111f1",
+			"hrs_ba6591673c93",
+			"0",
+			"Asistencia registrada: Esteban Robles",
+			"cmp_3b827a32c35b",
+			"2026-09-28",
+		)
+		nfc.save_queue([nfc.nueva_lectura("a36f48n9", "", 9.9, -84.0, "2026-09-28 10:00:05")])
+		self.assertTrue(nfc.process_queue_once())
+		with open(nfc.RESULT_FILE, "r") as handle:
+			saved = json.loads(handle.read())
+		self.assertEqual(saved["bus"], "15")
 
 	def test_espera_si_falta_el_numero_de_bus(self):
 		nfc.save_queue([nfc.nueva_lectura("a36f48n9", "", 0, 0, "2026-09-28 10:00:03")])
